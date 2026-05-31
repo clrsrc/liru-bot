@@ -1,0 +1,107 @@
+[package]
+name = "liru-bot"
+version = "0.1.0"
+edition = "2021"
+authors = ["Stefan Kammann", "lichess-bot contributors (Python original)"]
+description = "LiRu-Bot — a bridge between the Lichess Bot API and chess engines. Rust port of lichess-bot."
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/clrsrc/liru-bot"
+readme = "README.md"
+rust-version = "1.75"
+
+[[bin]]
+name = "liru-bot"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.40", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io", "codec"] }
+futures = "0.3"
+async-trait = "0.1"
+
+# HTTP / streaming
+reqwest = { version = "0.12", features = ["json", "stream", "gzip", "rustls-tls"], default-features = false }
+url = "2.5"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml_ng = "0.10"
+
+# CLI / config
+clap = { version = "4.5", features = ["derive"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+tracing-appender = "0.2"
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# In-process clrsrc engine, behind the optional `embedded` feature. Embedded API
+# contract: see clrsrc's EMBEDDED.md
+# (https://github.com/clrsrc/clrsrc/blob/v1.1.0/EMBEDDED.md).
+#
+# The DEFAULT (subprocess) build never compiles clrsrc and keeps its GPL out of
+# the default artifact. Pinned to tag v1.1.0 for reproducibility and a stable
+# AGPL §6 / GPL §6 Corresponding Source (clrsrc @ v1.1.0). NOTE: Cargo resolves
+# every optional dependency's manifest at lock time, so a default build needs
+# network to read clrsrc's manifest — but it does not compile or download
+# clrsrc itself unless `--features embedded` is set.
+clrsrc = { git = "https://github.com/clrsrc/clrsrc", tag = "v1.1.0", optional = true }
+# Local embedded development without network: override the line above with a
+# sibling checkout instead —
+# clrsrc = { path = "../clrsrc", optional = true }
+
+# Chess primitives
+shakmaty = "0.27"
+shakmaty-syzygy = "0.25"
+# Gaviota tablebases — FFI bindings to libgtb. The C library lives behind
+# `gaviota-sys` (same author as shakmaty); the safe wrapper lives in
+# `src/egtb.rs::get_gaviota_move`. Optional behind the `gaviota` feature
+# below so users who don't have/want Gaviota tables can still build.
+gaviota-sys = { version = "0.1", optional = true }
+
+# Random
+rand = "0.8"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Misc
+bytes = "1.7"
+once_cell = "1.20"
+regex = "1.11"
+byteorder = "1.5"
+
+[features]
+default = ["gaviota"]
+# Gaviota tablebases. Pulls in `gaviota-sys`, which compiles C code via
+# the `cc` crate at build time — disable if your build environment has
+# no C toolchain or you don't intend to use Gaviota tables.
+gaviota = ["dep:gaviota-sys"]
+# In-process clrsrc engine (see clrsrc's EMBEDDED.md). Links
+# clrsrc as a library so the bot can give the search an authoritative absolute
+# wall-clock deadline instead of the stacked double time-approximation. Opt-in;
+# the subprocess UCI backend stays the default. The bot crate's release profile
+# leaves `panic` unset (= "unwind"), so `catch_unwind` around the embedded
+# search works and clrsrc's own `panic="abort"` (its standalone UCI profile) is
+# ignored when it is built as a dependency (top-level crate's profile wins).
+embedded = ["dep:clrsrc"]
+
+[dev-dependencies]
+tempfile = "3.13"
+tokio-test = "0.4"
+wiremock = "0.6"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
+[profile.dev]
+opt-level = 0

@@ -1,0 +1,107 @@
+# LiRu-Bot example configuration.
+#
+# Copy this file to `config.yml` and fill in your own values. `config.yml` is
+# git-ignored on purpose because it holds your Lichess API token — never commit it.
+#
+# Only the most common fields are shown here. See the upstream lichess-bot
+# `config.yml.default` for the exhaustive reference, as LiRu-Bot mirrors its
+# configuration surface:
+#   https://github.com/lichess-bot-devs/lichess-bot/blob/master/config.yml.default
+
+token: ""                       # Lichess API token with the `bot:play` scope.
+                                # Create one at https://lichess.org/account/oauth/token
+url: "https://lichess.org/"     # Usually unchanged.
+
+abort_time: 20                  # Seconds before the bot aborts an inactive challenge.
+move_overhead: 1000             # Milliseconds of buffer for network latency.
+rate_limiting_delay: 0          # Minimum pause between move sends (ms).
+
+pgn_directory: ""               # Empty / omitted → no PGN saving.
+pgn_file_grouping: "game"       # game | opponent | all
+
+engine:
+  dir: "/path/to/engine"        # Directory containing the engine binary.
+  name: "engine"                # Engine executable name (e.g. stockfish, lc0, clrsrc).
+  working_dir: ""               # Empty → same as `dir`.
+  protocol: "uci"               # uci | xboard | homemade
+  ponder: false                 # Legacy; prefer uci_ponder.
+  uci_ponder: false             # Real UCI ponderhit / pondering.
+
+  uci_options:
+    Threads: 1
+    Hash: 256
+    # EvalFile: "/path/to/net.nnue"
+
+  draw_or_resign:
+    offer_draw_enabled: false
+    resign_enabled: false
+    offer_draw_for_egtb_zero: true
+    resign_for_egtb_minus_two: true
+
+  polyglot:
+    enabled: false
+    book:
+      standard: []              # e.g. ["/path/to/book.bin"]
+    selection: "weighted_random"  # NOTE: belongs on the `polyglot` level, not under `book`.
+    max_depth: 20
+    min_weight: 1
+
+  lichess_bot_tbs:
+    syzygy:
+      enabled: false
+      paths: []                 # e.g. ["/path/to/3-4-5-WDL", "/path/to/3-4-5-DTZ"]
+      max_pieces: 6
+      move_quality: "best"
+    gaviota:
+      enabled: false
+      paths: []
+      max_pieces: 5
+      move_quality: "best"
+
+  online_moves:
+    max_out_of_book_moves: 8
+    max_depth: 8
+    chessdb_book: { enabled: false }
+    lichess_cloud_analysis: { enabled: false }
+    lichess_opening_explorer: { enabled: false }
+    online_egtb: { enabled: false, source: "lichess" }
+
+challenge:
+  concurrency: 1                # Max parallel games.
+  max_increment: 30
+  min_increment: 0
+  max_base: 600
+  min_base: 30
+  variants: ["standard"]
+  time_controls: ["bullet", "blitz", "rapid"]
+  modes: ["casual", "rated"]
+  block_list: []
+  online_block_list: []         # URLs to newline-separated blocklist files.
+  recent_bot_challenge_age: 60
+  max_recent_bot_challenges: 2
+  sort_by: "best"               # best | first
+  preference: "none"            # none | human | bot
+
+matchmaking:
+  allow_matchmaking: false      # true → the bot sends its own challenges.
+  allow_during_games: false
+  challenge_variant: "standard"
+  challenge_initial_time: [180, 300]
+  challenge_increment: [0, 2]
+  challenge_mode: "rated"
+  opponent_min_rating: 2400
+  opponent_max_rating: 4000
+  opponent_rating_difference: 500
+  challenge_filter: "fine"      # none | coarse | fine
+
+greeting:
+  hello: "Hi {opponent}, GLHF"
+  goodbye: "GG"
+  hello_spectators: ""
+  goodbye_spectators: ""
+
+correspondence:
+  move_time: 60                 # Seconds per move for correspondence games.
+  checkin_period: 600
+  disconnect_time: 300
+  ponder: false

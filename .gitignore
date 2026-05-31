@@ -1,0 +1,61 @@
+# ---------------------------------------------------------------------------
+# Build output
+# ---------------------------------------------------------------------------
+/target
+/dist
+*.exe
+**/*.rs.bk
+src.bak-*
+
+# ---------------------------------------------------------------------------
+# Secrets & private runtime data — NEVER commit (see the project's secrets policy)
+# ---------------------------------------------------------------------------
+# Live config holds the Lichess API token. Ship config.yml.example instead.
+config.yml
+config.local.yml
+*.vserver.yml
+
+# Matchmaking opponent database — contains real opponent usernames + history.
+opponent_db.json
+*.opponent_db.json
+matchmaking*.json
+
+# Harvested experience / opening overlays (private self-play data).
+*.exp
+*.exp.overlay
+*.overlay
+
+# Engine artifacts (own, not redistributable here).
+*.nnue
+*.bin
+
+# Endgame tablebases.
+*.rtbw
+*.rtbz
+*.rtbz2
+*.gtb
+*.gtb.cp4
+
+# ---------------------------------------------------------------------------
+# Logs & game records
+# ---------------------------------------------------------------------------
+*.log
+/logs
+/runlog
+*.pgn
+/pgns
+
+# ---------------------------------------------------------------------------
+# Internal / non-published docs (kept out of the public repo)
+# ---------------------------------------------------------------------------
+PORT_STATUS.md
+BENUTZUNG.pdf
+
+# ---------------------------------------------------------------------------
+# OS / editor noise
+# ---------------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+*.swp
+/.idea
+/.vscode
