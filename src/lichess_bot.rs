@@ -25,6 +25,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use rand::rngs::StdRng;
+use rand::Rng;
 use rand::SeedableRng;
 use shakmaty::fen::Fen;
 use shakmaty::uci::UciMove;
@@ -41,7 +42,7 @@ use crate::engine_wrapper::{
     check_for_draw_offer, play_move, DrawResignTracker, EngineBackend, UciClient,
 };
 use crate::exp_overlay::{GameWdl, Jbk2Entry};
-use crate::lichess::Lichess;
+use crate::lichess::{Lichess, LichessError};
 use crate::lichess_types::{
     ChallengeType, EventType, GameEventType, GameStateType, JsonValue, UserProfileType,
 };
@@ -242,12 +243,17 @@ pub async fn start_program(
                         }
                         let mut backoff = Duration::from_secs(5);
                         loop {
-                            tokio::time::sleep(backoff).await;
+                            let jitter = Duration::from_millis(matchmaking_rng.gen_range(0..1000));
+                            tokio::time::sleep(backoff + jitter).await;
                             match li.get_event_stream().await {
                                 Ok(s) => {
                                     event_stream = Box::pin(s);
                                     info!("event stream reopened");
                                     break;
+                                }
+                                Err(LichessError::RateLimited { timeout, .. }) => {
+                                    warn!("event stream rate-limited, honoring retry-after {:?}", timeout);
+                                    backoff = timeout.max(backoff);
                                 }
                                 Err(e) => {
                                     error!("event stream reconnect failed: {e}, retry in {:?}", backoff);
@@ -741,12 +747,59 @@ async fn play_game(
         let evt = tokio::select! {
             biased;
             maybe_evt = stream.next() => match maybe_evt {
-                None => break,
-                Some(Err(e)) => {
-                    warn!(game_id = %game.id, "game stream error: {e}");
-                    break;
-                }
                 Some(Ok(evt)) => evt,
+                other => {
+                    // Both stream EOF (None) and transport errors trigger a
+                    // clock-aware resubscribe rather than abandoning the game.
+                    // Lichess resends gameFull on the new connection; the
+                    // gameFull arm below resyncs board state and replays moves.
+                    match &other {
+                        None => warn!(game_id = %game.id, "game stream ended; resubscribing"),
+                        Some(Err(e)) => warn!(game_id = %game.id, "game stream error: {e}; resubscribing"),
+                        Some(Ok(_)) => unreachable!(),
+                    }
+                    // Budget: fast early retries, capped at min(12 s, 10% of
+                    // remaining clock) to avoid burning time in Blitz/Bullet.
+                    // Correspondence (no clock) and timed-out clocks use 12 s.
+                    let remaining = game.my_remaining_time();
+                    let budget = if remaining.is_zero() {
+                        Duration::from_secs(12)
+                    } else {
+                        Duration::from_secs(12).min(remaining / 10).max(Duration::from_secs(1))
+                    };
+                    let delays = [
+                        Duration::from_secs(1),
+                        Duration::from_secs(2),
+                        Duration::from_secs(4),
+                        Duration::from_secs(8),
+                    ];
+                    let mut total_waited = Duration::ZERO;
+                    let mut resubscribed = false;
+                    for delay in delays {
+                        if total_waited + delay > budget {
+                            break;
+                        }
+                        tokio::time::sleep(delay).await;
+                        total_waited += delay;
+                        match li.get_game_stream(&game.id).await {
+                            Ok(s) => {
+                                stream = Box::pin(s);
+                                info!(game_id = %game.id, "game stream resubscribed");
+                                resubscribed = true;
+                                break;
+                            }
+                            Err(e2) => {
+                                error!(game_id = %game.id, "game stream resubscription failed: {e2}");
+                            }
+                        }
+                    }
+                    if resubscribed {
+                        continue;
+                    } else {
+                        warn!(game_id = %game.id, "game stream resubscribe budget exhausted, giving up");
+                        break;
+                    }
+                }
             },
             _ = inactivity_tick.tick() => {
                 if game.should_abort_now() {
@@ -860,6 +913,66 @@ async fn play_game(
                         )
                         .await?;
                     }
+                }
+            }
+            Some("gameFull") => {
+                // Received on reconnect. Resync board and state from the
+                // embedded gameState; the full move list covers any moves
+                // missed during disconnect. Pass prior=None to is_engine_move
+                // so we play even when the move list didn't change (e.g. we
+                // disconnected exactly on our turn and no move was delivered).
+                let new_state = match evt.state {
+                    Some(s) => s,
+                    None => {
+                        warn!(game_id = %game.id, "gameFull on reconnect has no embedded state, exiting game task");
+                        break;
+                    }
+                };
+                game.state = new_state;
+                match setup_board(&game, castling_mode) {
+                    Ok(b) => board = b,
+                    Err(e) => {
+                        error!(game_id = %game.id, "gameFull reconnect board rebuild failed: {e}");
+                        break;
+                    }
+                }
+                *position_counts
+                    .entry(crate::polyglot::polyglot_hash(&board))
+                    .or_insert(0) += 1;
+
+                if is_game_over(&game.state) {
+                    info!(game_id = %game.id, status = ?game.state.status, "game ended during reconnect");
+                    if let Err(e) = engine.send_game_result(&game).await {
+                        warn!(game_id = %game.id, "send_game_result failed: {e}");
+                    }
+                    harvest_experience_overlay(&game, castling_mode, &engine, &config.engine.experience);
+                    send_goodbye(&conversation, &game, &config.greeting).await;
+                    save_pgn_if_configured(&li, &config, &game, &username).await;
+                    break;
+                }
+
+                let terminate_in = compute_terminate_in(&game, &board);
+                game.ping(abort_deadline(&game, abort_time), terminate_in, Duration::from_secs(0));
+
+                if is_engine_move(&game, None, &board) {
+                    maybe_send_greeting(&conversation, &game, &config.greeting, &mut greeted).await;
+                    play_one(
+                        &mut engine,
+                        &board,
+                        initial_fen.as_deref(),
+                        &game,
+                        &li,
+                        &config,
+                        &mut draw_resign,
+                        &mut rng,
+                        &setup_timer,
+                        move_overhead,
+                        can_ponder,
+                        is_correspondence,
+                        correspondence_move_time,
+                        min_time,
+                    )
+                    .await?;
                 }
             }
             Some("chatLine") => {

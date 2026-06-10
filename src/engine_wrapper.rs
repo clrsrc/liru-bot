@@ -642,6 +642,19 @@ fn clamped_ms(value: Option<i64>) -> u64 {
     value.unwrap_or(0).max(0) as u64
 }
 
+/// Per-move overshoot cap in ms: `remaining / 30 + increment`.
+///
+/// BUS #3/#9/#10/#13 (Game EqGn5ie6): clrsrc's `stability_factor` can inflate
+/// the soft limit in flat, best-move-oscillating positions; on slow hardware the
+/// engine then runs a deep iteration toward the hard cap (126 s on a single move
+/// → forfeit). The engine-side fix (`SOFT_INFLATION_CAP`) was SPRT-rejected as
+/// ELO-neutral-negative, so this bot-side cap is the *only* overshoot protection.
+/// In normal play it is ~the engine's own per-move budget, so it binds only in
+/// the pathological case (clrsrc green-lit `min(soft, remaining/30 + inc)`).
+fn movetime_cap_ms(remaining_ms: u64, inc_ms: u64) -> u64 {
+    remaining_ms / 30 + inc_ms
+}
+
 /// Number of half-moves already played, derived from the UCI `moves`
 /// string in [`GameStateType`]. Empty / missing → 0.
 pub fn move_count(state: &GameStateType) -> usize {
@@ -687,9 +700,15 @@ pub fn single_move_time(
     GoLimits::movetime(search_time.as_millis() as u64)
 }
 
-/// Realtime game: ship both clocks + increments. The side-to-move's clock
-/// is reduced by the overhead so the engine doesn't burn budget we've
-/// already spent receiving the move.
+/// Realtime game: cap the search at `remaining/30 + inc` via `go movetime`.
+///
+/// We used to ship the raw clocks and let the engine budget itself, but that
+/// left the overshoot class (see [`movetime_cap_ms`]) uncapped on the
+/// subprocess path. clrsrc honors `go movetime` as `soft = hard = movetime`
+/// (time.rs:133), so this bounds the rare soft-inflation overshoot; it also
+/// bounds any generic UCI engine driven through the subprocess backend (the
+/// trade-off: a fixed per-move budget instead of engine-side clock management).
+/// The cap is further clamped to the real clock minus the comms overhead.
 pub fn game_clock_time(
     side: Side,
     state: &GameStateType,
@@ -697,22 +716,16 @@ pub fn game_clock_time(
     move_overhead: Duration,
 ) -> GoLimits {
     let overhead = setup_timer.time_since_reset() + move_overhead;
-    let mut wtime = Duration::from_millis(clamped_ms(state.wtime));
-    let mut btime = Duration::from_millis(clamped_ms(state.btime));
-    let winc = Duration::from_millis(clamped_ms(state.winc));
-    let binc = Duration::from_millis(clamped_ms(state.binc));
+    let (remaining_ms, inc_ms) = match side {
+        Side::White => (clamped_ms(state.wtime), clamped_ms(state.winc)),
+        Side::Black => (clamped_ms(state.btime), clamped_ms(state.binc)),
+    };
     let min = Duration::from_millis(MIN_CLOCK_MS);
-    match side {
-        Side::White => wtime = wtime.saturating_sub(overhead).max(min),
-        Side::Black => btime = btime.saturating_sub(overhead).max(min),
-    }
-    GoLimits {
-        wtime_ms: Some(wtime.as_millis() as u64),
-        btime_ms: Some(btime.as_millis() as u64),
-        winc_ms: Some(winc.as_millis() as u64),
-        binc_ms: Some(binc.as_millis() as u64),
-        ..Default::default()
-    }
+    // Time actually left after the overhead we've already spent receiving the move.
+    let avail = Duration::from_millis(remaining_ms).saturating_sub(overhead).max(min);
+    let cap = Duration::from_millis(movetime_cap_ms(remaining_ms, inc_ms));
+    let search = cap.min(avail).max(min);
+    GoLimits::movetime(search.as_millis() as u64)
 }
 
 /// Top-level dispatch — replicates Python's `move_time(...)`. Returns
@@ -1436,7 +1449,7 @@ impl EngineLike for UciClient {
 // ---------------------------------------------------------------------------
 
 /// The time inputs the in-process embedded engine needs for one move
-/// (clrsrc's EMBEDDED.md B3). The subprocess backend ignores this and
+/// (BOT_ENGINE_INTEGRATION_PLAN.md B3). The subprocess backend ignores this and
 /// keeps using `game_clock_time`.
 ///
 /// The whole point: today the overhead is paid **twice** — `game_clock_time`
@@ -1498,12 +1511,19 @@ impl EmbeddedTiming {
             }
             None => {
                 // Clock mode: hard ceiling = flag-fall − overhead
-                //            = now + remaining − elapsed − move_overhead.
-                let remaining = match side {
-                    Side::White => clamped_ms(state.wtime),
-                    Side::Black => clamped_ms(state.btime),
+                //            = now + remaining − elapsed − move_overhead,
+                // then tightened to the per-move overshoot cap (see
+                // `movetime_cap_ms`). clrsrc clamps its form-aware hard limit to
+                // `max_deadline`, so the cap binds only when clrsrc would
+                // otherwise overshoot — normal moves keep clrsrc's soft
+                // adaptivity (unlike the subprocess movetime collapse).
+                let (remaining, inc) = match side {
+                    Side::White => (clamped_ms(state.wtime), clamped_ms(state.winc)),
+                    Side::Black => (clamped_ms(state.btime), clamped_ms(state.binc)),
                 };
-                let budget = Duration::from_millis(remaining).saturating_sub(buffer).max(min_budget);
+                let hard = Duration::from_millis(remaining).saturating_sub(buffer);
+                let cap = Duration::from_millis(movetime_cap_ms(remaining, inc));
+                let budget = hard.min(cap).max(min_budget);
                 (now + budget, 0)
             }
         };
@@ -1527,7 +1547,7 @@ impl EmbeddedTiming {
 // ---------------------------------------------------------------------------
 
 /// The engine the bot drives for one game. The subprocess UCI client is the
-/// default; the in-process embedded clrsrc engine (clrsrc's EMBEDDED.md
+/// default; the in-process embedded clrsrc engine (BOT_ENGINE_INTEGRATION_PLAN.md
 /// B1) is opt-in behind the `embedded` feature and only selected for standard
 /// chess (clrsrc's FEN parser has no Chess960 castling). The bot loop holds one
 /// of these per game and forwards the same calls to whichever backend is active.
@@ -2135,7 +2155,8 @@ mod tests {
     #[test]
     fn second_move_uses_game_clock_in_realtime() {
         // 2 half-moves already played → next move is the 3rd, no longer
-        // covered by the fixed "first move" budget.
+        // covered by the fixed "first move" budget. The realtime path now caps
+        // the search at remaining/30 + inc via `go movetime`.
         let state = state_with_moves("e2e4 e7e5", 300_000, 295_000, 2_000, 2_000);
         let (limits, can_ponder) = move_time(
             Side::White,
@@ -2146,31 +2167,30 @@ mod tests {
             false,
             Duration::ZERO,
         );
-        // Black clock untouched (it's not their move), White clock reduced
-        // only by the tiny Timer::now() drift.
-        assert!(close_to(limits.wtime_ms, 300_000, 5));
-        assert_eq!(limits.btime_ms, Some(295_000));
-        assert_eq!(limits.winc_ms, Some(2_000));
-        assert_eq!(limits.binc_ms, Some(2_000));
-        assert!(limits.movetime_ms.is_none());
+        // 300000/30 + 2000 = 12000. The cap is derived from the raw clock, so
+        // the tiny Timer drift doesn't move it (it only shrinks `avail`, which
+        // stays far above the cap here).
+        assert_eq!(limits.movetime_ms, Some(12_000));
+        assert!(limits.wtime_ms.is_none());
         assert!(can_ponder);
     }
 
     #[test]
-    fn game_clock_subtracts_overhead_from_side_to_move_only() {
+    fn game_clock_caps_movetime_per_side() {
         let state = state_with_moves("e2e4 e7e5", 300_000, 295_000, 2_000, 2_000);
-        let limits = game_clock_time(
-            Side::White,
-            &state,
-            &Timer::zero(),
-            Duration::from_millis(500),
-        );
-        assert!(close_to(limits.wtime_ms, 299_500, 5));
-        assert_eq!(limits.btime_ms, Some(295_000));
+        // White: 300000/30 + 2000 = 12000.
+        let w = game_clock_time(Side::White, &state, &Timer::zero(), Duration::from_millis(500));
+        assert_eq!(w.movetime_ms, Some(12_000));
+        assert!(w.wtime_ms.is_none());
+        // Black: 295000/30 + 2000 = 11833 — the cap follows the side to move.
+        let b = game_clock_time(Side::Black, &state, &Timer::zero(), Duration::from_millis(500));
+        assert_eq!(b.movetime_ms, Some(11_833));
     }
 
     #[test]
     fn game_clock_clamps_to_one_ms_when_overhead_exceeds_remaining() {
+        // 50 ms left, 100 ms overhead → `avail` clamps to 1 ms, below the
+        // cap (50/30 = 1), so the movetime clamps to the 1 ms floor.
         let state = state_with_moves("e2e4 e7e5", 50, 60_000, 0, 0);
         let limits = game_clock_time(
             Side::White,
@@ -2178,7 +2198,54 @@ mod tests {
             &Timer::zero(),
             Duration::from_millis(100),
         );
-        assert_eq!(limits.wtime_ms, Some(1));
+        assert_eq!(limits.movetime_ms, Some(1));
+    }
+
+    #[test]
+    fn embedded_clock_mode_tightens_deadline_to_overshoot_cap() {
+        // Plenty of clock → the per-move cap (300000/30 + 2000 = 12000 ms), not
+        // the flag-fall ceiling, is what bounds `max_deadline`. Raw clocks still
+        // ride along untouched for clrsrc's own soft computation.
+        let state = state_with_moves("e2e4 e7e5", 300_000, 295_000, 2_000, 2_000);
+        let t = EmbeddedTiming::compute(
+            Side::White,
+            &state,
+            &Timer::zero(),
+            Duration::from_millis(300),
+            &GoLimits::default(),
+        );
+        let budget_ms = t
+            .max_deadline
+            .saturating_duration_since(std::time::Instant::now())
+            .as_millis() as u64;
+        assert!(
+            (11_900..=12_000).contains(&budget_ms),
+            "expected ~12000 ms cap, got {budget_ms}"
+        );
+        assert_eq!(t.wtime_ms, 300_000);
+        assert_eq!(t.movetime_ms, 0);
+    }
+
+    #[test]
+    fn embedded_clock_mode_falls_back_to_flag_fall_in_scramble() {
+        // 5 s left, 300 ms overhead → cap would be 5000/30 = 166 ms, but the
+        // flag-fall ceiling (5000 − 300 = 4700) is larger, so the cap binds.
+        // Conversely with no increment and a near-flat clock the hard ceiling
+        // is the smaller term and protects the flag.
+        let state = state_with_moves("e2e4 e7e5", 400, 60_000, 0, 0);
+        let t = EmbeddedTiming::compute(
+            Side::White,
+            &state,
+            &Timer::zero(),
+            Duration::from_millis(300),
+            &GoLimits::default(),
+        );
+        let budget_ms = t
+            .max_deadline
+            .saturating_duration_since(std::time::Instant::now())
+            .as_millis() as u64;
+        // cap = 400/30 = 13 ms; hard = 400 − 300 = 100 ms → min = 13 ms.
+        assert!(budget_ms <= 13, "expected cap ≤13 ms, got {budget_ms}");
     }
 
     #[test]

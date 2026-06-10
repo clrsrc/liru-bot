@@ -37,12 +37,6 @@ use crate::timer::{sec_str, seconds, Timer};
 pub const MAX_CHAT_MESSAGE_LEN: usize = 140;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
-/// Streaming endpoints (`/stream/event`, `/bot/game/stream/{id}`) stay
-/// open for the lifetime of the game/session. We must NOT pass a
-/// request-level timeout to reqwest here — that timeout covers the
-/// whole response, including bytes still arriving. Python mirrors this
-/// with `requests.get(..., stream=True, timeout=None)`.
-const STREAM_TIMEOUT: Option<Duration> = None;
 const BACKOFF_MAX_TIME: Duration = Duration::from_secs(60);
 const BACKOFF_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -394,6 +388,29 @@ impl Lichess {
             Ok(response.error_for_status()?)
         })
         .await
+    }
+
+    /// Single-attempt GET for streaming endpoints — no backoff retry loop.
+    ///
+    /// `get_event_stream` and `get_game_stream` use this instead of
+    /// `send_get`. The outer reconnect loops in `lichess_bot.rs` own the
+    /// retry cadence (exponential 5 s → 60 s). Using `with_backoff` here
+    /// would retry at 100 ms intervals for up to 60 s on a transient
+    /// network blip — ≈ 600 rapid requests that trigger Lichess 429 and
+    /// can cascade to kill game streams that are still alive.
+    async fn try_get_stream(
+        &self,
+        endpoint: Endpoint,
+        args: &[&str],
+    ) -> LichessResult<Response> {
+        self.check_rate_limit(endpoint)?;
+        let path = endpoint.render(args);
+        let url = self.base_url.join(&path)?;
+        let response = self.client.get(url).send().await?;
+        if response.status() == StatusCode::TOO_MANY_REQUESTS {
+            self.set_rate_limit_delay(endpoint.template(), Self::rate_limit_delay_for(endpoint));
+        }
+        Ok(response.error_for_status()?)
     }
 
     async fn send_post(
@@ -769,9 +786,7 @@ impl Lichess {
     pub async fn get_event_stream(
         &self,
     ) -> LichessResult<impl Stream<Item = LichessResult<EventType>> + Send + 'static> {
-        let response = self
-            .send_get(Endpoint::StreamEvent, &[], &[], STREAM_TIMEOUT)
-            .await?;
+        let response = self.try_get_stream(Endpoint::StreamEvent, &[]).await?;
         Ok(ndjson_stream::<EventType>(response))
     }
 
@@ -780,9 +795,7 @@ impl Lichess {
         &self,
         game_id: &str,
     ) -> LichessResult<impl Stream<Item = LichessResult<GameEventType>> + Send + 'static> {
-        let response = self
-            .send_get(Endpoint::Stream, &[game_id], &[], STREAM_TIMEOUT)
-            .await?;
+        let response = self.try_get_stream(Endpoint::Stream, &[game_id]).await?;
         Ok(ndjson_stream::<GameEventType>(response))
     }
 }
@@ -865,8 +878,8 @@ mod tests {
             "/api/bot/game/abc123/move/e2e4"
         );
         assert_eq!(
-            Endpoint::PublicData.render(&["testbot"]),
-            "/api/user/testbot"
+            Endpoint::PublicData.render(&["StefanBot"]),
+            "/api/user/StefanBot"
         );
     }
 
@@ -1022,7 +1035,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/api/token/test"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "test-token": { "scopes": "preference:read", "userId": "user" }
+                "test-token": { "scopes": "preference:read", "userId": "stefan" }
             })))
             .mount(&server)
             .await;
@@ -1040,7 +1053,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/api/token/test"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "test-token": { "scopes": "bot:play,preference:read", "userId": "user" }
+                "test-token": { "scopes": "bot:play,preference:read", "userId": "stefan" }
             })))
             .mount(&server)
             .await;
@@ -1095,6 +1108,62 @@ mod tests {
         assert_eq!(second.game.unwrap().id.as_deref(), Some("g1"));
 
         assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn stream_open_failure_is_single_attempt_no_storm() {
+        // Connectivity-Hardening Fix 2a: a failing stream open must hit the
+        // endpoint exactly ONCE. The old `send_get` path retried every 100 ms
+        // for up to 60 s (~600 requests) on a transient blip — that burst is
+        // what triggered Lichess's /api/stream/event 429 cascade. `try_get_stream`
+        // does a single attempt; the reconnect loop in lichess_bot paces retries.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/stream/event"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+
+        let bot = make_client(&server);
+        let res = tokio::time::timeout(Duration::from_secs(2), bot.get_event_stream()).await;
+        assert!(res.is_ok(), "stream open must return promptly, not spin in a 60 s backoff loop");
+        assert!(res.unwrap().is_err(), "503 stream open should surface an error");
+
+        let hits = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path() == "/api/stream/event")
+            .count();
+        assert_eq!(hits, 1, "stream open must be a single attempt, got {hits}");
+    }
+
+    #[tokio::test]
+    async fn event_stream_429_surfaces_rate_limited_for_reconnect() {
+        // Connectivity-Hardening Fix 2b relies on get_event_stream surfacing
+        // LichessError::RateLimited after a 429, so the reconnect loop can honor
+        // the server's retry-after window instead of retrying too early.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/stream/event"))
+            .respond_with(ResponseTemplate::new(429))
+            .mount(&server)
+            .await;
+
+        let bot = make_client(&server);
+        // First call: receives 429 and records the per-endpoint rate-limit timer.
+        let _ = bot.get_event_stream().await;
+        // Second call: short-circuited by check_rate_limit → RateLimited variant.
+        let err = bot
+            .get_event_stream()
+            .await
+            .err()
+            .expect("rate-limited stream open should error");
+        assert!(
+            matches!(err, LichessError::RateLimited { .. }),
+            "expected RateLimited so the reconnect loop honors retry-after, got {err:?}"
+        );
     }
 
     #[tokio::test]

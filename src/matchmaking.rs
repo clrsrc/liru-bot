@@ -341,6 +341,9 @@ impl Matchmaking {
         let online_bots: Vec<UserProfileType> = online_bots_raw
             .into_iter()
             .filter(|bot| self.is_suitable_opponent(bot, &game_type, min_rating, max_rating))
+            // Diversity brake: drop opponents we've already challenged to the
+            // daily cap, so a single bot can't monopolise matchmaking.
+            .filter(|bot| self.under_daily_challenge_cap(bot))
             .collect();
 
         let ready_bots: Vec<UserProfileType> = online_bots
@@ -354,13 +357,28 @@ impl Matchmaking {
             online_bots
         };
 
-        let weights = Self::get_weights(
+        let rating_weights = Self::get_weights(
             &candidates,
             &rating_preference,
             min_rating,
             max_rating,
             &game_type,
         );
+        // Soft diversity: below the hard cap, down-weight opponents we've
+        // already played today so fresh bots are preferred when several are
+        // online. Each prior game today divides the rating weight by one more.
+        let weights: Vec<i64> = candidates
+            .iter()
+            .zip(rating_weights)
+            .map(|(bot, w)| {
+                let played = bot
+                    .username
+                    .as_deref()
+                    .map(|n| self.opponent_db.challenges_today(n))
+                    .unwrap_or(0);
+                (w.max(1) / (played as i64 + 1)).max(1)
+            })
+            .collect();
 
         let bot_username = if candidates.is_empty() {
             error!("No suitable bots found to challenge.");
@@ -396,6 +414,21 @@ impl Matchmaking {
                 warn!(%name, %err, "could not fetch opponent profile");
                 None
             }
+        }
+    }
+
+    /// Diversity brake: returns `false` once we have already initiated
+    /// `max_challenges_per_opponent_per_day` challenges against this bot today
+    /// (local date), so matchmaking stops farming a single opponent. A cap of
+    /// `0` disables the brake (unlimited). Opponents with no username pass.
+    fn under_daily_challenge_cap(&self, bot: &UserProfileType) -> bool {
+        let cap = self.matchmaking_cfg.max_challenges_per_opponent_per_day;
+        if cap == 0 {
+            return true;
+        }
+        match bot.username.as_deref() {
+            Some(name) => self.opponent_db.challenges_today(name) < cap,
+            None => true,
         }
     }
 
@@ -849,5 +882,33 @@ mod tests {
         mm.add_to_block_list("Foo");
         assert!(mm.in_block_list("Foo"));
         assert!(!mm.in_block_list("Bar"));
+    }
+
+    #[test]
+    fn daily_challenge_cap_filters_overplayed_opponent() {
+        let mut mm = direct_struct();
+        // Default cap is 5.
+        mm.matchmaking_cfg.max_challenges_per_opponent_per_day = 5;
+        let repeat = bot_with_rating("Repeat", "blitz", 2000, 50);
+        let fresh = bot_with_rating("Fresh", "blitz", 2000, 50);
+
+        // Fresh opponent is always allowed.
+        assert!(mm.under_daily_challenge_cap(&fresh));
+
+        // Four challenges: still under the cap.
+        for _ in 0..4 {
+            mm.opponent_db
+                .record_challenge_sent("Repeat", ChallengeForm::default());
+        }
+        assert!(mm.under_daily_challenge_cap(&repeat));
+
+        // Fifth challenge reaches the cap → now excluded.
+        mm.opponent_db
+            .record_challenge_sent("Repeat", ChallengeForm::default());
+        assert!(!mm.under_daily_challenge_cap(&repeat));
+
+        // Cap of 0 disables the brake.
+        mm.matchmaking_cfg.max_challenges_per_opponent_per_day = 0;
+        assert!(mm.under_daily_challenge_cap(&repeat));
     }
 }

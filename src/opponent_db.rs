@@ -180,6 +180,29 @@ impl OpponentDb {
         self.records.values().filter(|r| r.no_bots).count()
     }
 
+    /// How many challenges we have *initiated* against `username` so far today
+    /// (local calendar day). Drives the matchmaking diversity brake so we don't
+    /// farm a single opponent. Counts `challenged` history events whose
+    /// timestamp falls on today's date.
+    pub fn challenges_today(&self, username: &str) -> u32 {
+        self.challenges_on(username, &today_local())
+    }
+
+    /// Testable core of [`challenges_today`]: counts `challenged` events whose
+    /// RFC-3339 timestamp begins with `date` (`YYYY-MM-DD`). History is capped
+    /// at [`MAX_HISTORY`], more than enough to span a single day's challenges.
+    fn challenges_on(&self, username: &str, date: &str) -> u32 {
+        self.records
+            .get(username)
+            .map(|r| {
+                r.history
+                    .iter()
+                    .filter(|h| h.event == "challenged" && h.at.len() >= 10 && h.at[..10] == *date)
+                    .count() as u32
+            })
+            .unwrap_or(0)
+    }
+
     /// Record that we sent a challenge to `username` with `form`.
     pub fn record_challenge_sent(&mut self, username: &str, form: ChallengeForm) {
         let now = now_rfc3339();
@@ -261,6 +284,12 @@ impl OpponentDb {
 /// logic don't depend on wall-clock formatting details.
 fn now_rfc3339() -> String {
     chrono::Local::now().to_rfc3339()
+}
+
+/// Current local date as `YYYY-MM-DD` — matches the first 10 chars of
+/// [`now_rfc3339`], so the diversity brake compares like for like.
+fn today_local() -> String {
+    chrono::Local::now().format("%Y-%m-%d").to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -361,6 +390,32 @@ mod tests {
         assert_eq!(rec.history.len(), 3);
         assert_eq!(rec.history[1].event, "accepted");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn challenges_today_counts_only_todays_initiated_challenges() {
+        // In-memory db (empty path) is enough for counting logic.
+        let mut db = OpponentDb::load("");
+        db.record_challenge_sent("Repeat", form("casual"));
+        db.record_challenge_sent("Repeat", form("casual"));
+        let today = today_local();
+        assert_eq!(db.challenges_on("Repeat", &today), 2);
+
+        // A challenge dated long ago must not count toward today.
+        db.records.get_mut("Repeat").unwrap().history.push(HistoryEntry {
+            at: "2000-01-01T00:00:00+00:00".into(),
+            event: "challenged".into(),
+            form: form("casual"),
+        });
+        assert_eq!(db.challenges_on("Repeat", &today), 2);
+        assert_eq!(db.challenges_on("Repeat", "2000-01-01"), 1);
+
+        // `accepted` / `declined` events are not "initiated challenges".
+        db.record_accepted("Repeat");
+        assert_eq!(db.challenges_on("Repeat", &today), 2);
+
+        // Unknown opponent → 0.
+        assert_eq!(db.challenges_today("Nobody"), 0);
     }
 
     #[test]

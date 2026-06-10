@@ -599,6 +599,11 @@ pub struct MatchmakingConfig {
     /// persistence (in-memory only). Relative paths resolve against the
     /// bot's working directory.
     #[serde(default = "mm_opponent_db")] pub opponent_db_path: String,
+    /// Diversity brake: the maximum number of challenges we *initiate* against
+    /// the same opponent per local calendar day. Once reached, that bot is
+    /// skipped in matchmaking until the next day — we would rather idle than
+    /// farm a single opponent. `0` disables the cap (unlimited).
+    #[serde(default = "mm_max_per_opp")] pub max_challenges_per_opponent_per_day: u32,
     #[serde(default)] pub block_list: Vec<String>,
     #[serde(default)] pub online_block_list: Vec<String>,
     #[serde(default)] pub include_challenge_block_list: bool,
@@ -622,6 +627,7 @@ impl Default for MatchmakingConfig {
             challenge_mode: mm_mode(),
             challenge_filter: FilterType::None,
             opponent_db_path: mm_opponent_db(),
+            max_challenges_per_opponent_per_day: mm_max_per_opp(),
             block_list: Vec::new(),
             online_block_list: Vec::new(),
             include_challenge_block_list: false,
@@ -637,6 +643,7 @@ fn mm_opp_max_rating() -> i64 { 4000 }
 fn mm_rating_pref() -> String { "none".into() }
 fn mm_mode() -> String { "random".into() }
 fn mm_opponent_db() -> String { "matchmaking_opponents.json".into() }
+fn mm_max_per_opp() -> u32 { 5 }
 
 /// Accept missing / null / scalar / list — Python's `change_value_to_list`.
 fn deserialize_optional_int_list<'de, D>(deserializer: D) -> Result<Vec<Option<i64>>, D::Error>

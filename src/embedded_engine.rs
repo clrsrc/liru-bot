@@ -202,6 +202,33 @@ impl EmbeddedEngine {
             .to_move(pos)
             .map_err(|_| EngineError::BestmoveParse(best_uci.clone()))?;
 
+        // Per-move engine self-eval for the LMR-137 tactical watch / Klopper
+        // analysis (befunde/lmr137_tactical_watch.md): embedded returns the score
+        // via the `SearchOutcome` — there is no UCI `info … score cp … pv` text
+        // channel to tap — so surface it here at DEBUG. `score` is side-to-move
+        // POV, i.e. OUR POV (we only search on our own move), so a sharp drop
+        // between our consecutive moves is the search itself seeing the position
+        // turn. `depth=0, nodes=0` marks a book hit (no search).
+        {
+            let score_str = match &self.last_score {
+                Some(s) if s.mate.is_some() => format!("mate {}", s.mate.unwrap_or(0)),
+                Some(s) => match s.cp {
+                    Some(cp) => format!("cp {cp}"),
+                    None => "none".to_string(),
+                },
+                None => "none".to_string(),
+            };
+            tracing::debug!(
+                ply = game_ply,
+                bestmove = %best_uci,
+                score = %score_str,
+                depth = self.last_depth.unwrap_or(0),
+                nodes = self.last_nodes.unwrap_or(0),
+                pv = %self.last_pv_uci.join(" "),
+                "engine eval"
+            );
+        }
+
         Ok(MoveDecision {
             mv,
             source: MoveSource::Engine,
