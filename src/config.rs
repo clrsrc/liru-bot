@@ -131,7 +131,7 @@ fn default_protocol() -> String { "uci".into() }
 pub struct ExperienceConfig {
     #[serde(default)]
     pub harvest_enabled: bool,
-    /// Append target, e.g. `P:/Projekte/clrsrc/clrsrc.exp.overlay`.
+    /// Append target, e.g. `./clrsrc.exp.overlay`.
     #[serde(default)]
     pub overlay_path: String,
     /// How many of the bot's own moves (from move 1) to harvest per game.

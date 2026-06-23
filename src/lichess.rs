@@ -885,8 +885,8 @@ mod tests {
             "/api/bot/game/abc123/move/e2e4"
         );
         assert_eq!(
-            Endpoint::PublicData.render(&["StefanBot"]),
-            "/api/user/StefanBot"
+            Endpoint::PublicData.render(&["ExampleBot"]),
+            "/api/user/ExampleBot"
         );
     }
 
@@ -1042,7 +1042,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/api/token/test"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "test-token": { "scopes": "preference:read", "userId": "stefan" }
+                "test-token": { "scopes": "preference:read", "userId": "example" }
             })))
             .mount(&server)
             .await;
@@ -1060,7 +1060,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/api/token/test"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "test-token": { "scopes": "bot:play,preference:read", "userId": "stefan" }
+                "test-token": { "scopes": "bot:play,preference:read", "userId": "example" }
             })))
             .mount(&server)
             .await;
