@@ -38,6 +38,7 @@ use tracing::{debug, error, info, warn};
 use crate::blocklist::OnlineBlocklist;
 use crate::config::{Config, EngineConfig, GreetingConfig};
 use crate::conversation::{ChallengeQueue, ChatLine, Conversation};
+use crate::daily_counter::DailyCounter;
 use crate::engine_wrapper::{
     check_for_draw_offer, play_move, DrawResignTracker, EngineBackend, UciClient,
 };
@@ -165,12 +166,21 @@ pub async fn start_program(
     // to keep both copies in sync. A separate mutex from `BotState`
     // because `Matchmaking::challenge` does HTTP work and would otherwise
     // block the challenge-acceptance hot path.
+    // Shared UTC-daily bot-vs-bot game tally. Lives outside both `BotState`
+    // and `Matchmaking` because it is written by the event loop (on every
+    // started bot game) and read by both the incoming-challenge gate and the
+    // matchmaker. See `daily_counter`.
+    let daily_counter = Arc::new(Mutex::new(DailyCounter::load(
+        &config.matchmaking.daily_counter_path,
+    )));
+
     let blocklist_clone = state.lock().await.online_blocklist.clone();
     let matchmaker = Arc::new(Mutex::new(Matchmaking::new(
         (*li).clone(),
         &config,
         profile.clone(),
         blocklist_clone,
+        daily_counter.clone(),
     )));
     let matchmaking_enabled = config.matchmaking.allow_matchmaking;
     if matchmaking_enabled {
@@ -225,7 +235,7 @@ pub async fn start_program(
             event = event_stream.next() => {
                 match event {
                     Some(Ok(event)) => {
-                        if let Err(e) = handle_event(event, &li, &config, &profile, &state, &challengers, &matchmaker, &mut games).await {
+                        if let Err(e) = handle_event(event, &li, &config, &profile, &state, &challengers, &matchmaker, &daily_counter, &mut games).await {
                             error!("event handling failed: {e:#}");
                         }
                     }
@@ -456,12 +466,13 @@ async fn handle_event(
     state: &Arc<Mutex<BotState>>,
     challengers: &ChallengeQueue,
     matchmaker: &Arc<Mutex<Matchmaking>>,
+    daily_counter: &Arc<Mutex<DailyCounter>>,
     games: &mut JoinSet<(String, Result<()>)>,
 ) -> Result<()> {
     match event.kind.as_deref() {
         Some("challenge") => {
             if let Some(challenge_info) = event.challenge {
-                handle_challenge(challenge_info, li, config, profile, state).await;
+                handle_challenge(challenge_info, li, config, profile, state, matchmaker, daily_counter).await;
             }
         }
         Some("challengeCanceled") => {
@@ -515,8 +526,16 @@ async fn handle_event(
                 }
                 // Tell the matchmaker that this game start consumed the
                 // challenge we sent. If it wasn't our challenge, the call
-                // is a no-op.
-                matchmaker.lock().await.accepted_challenge(&event);
+                // is a no-op. A `true` return means this was our outbound
+                // matchmaking challenge — which only ever targets bots — so it
+                // counts toward the daily bot-vs-bot tally. (Incoming bot games
+                // are counted at accept time in `handle_challenge`; together the
+                // two cover every bot-vs-bot game without double counting.)
+                let was_our_outbound = matchmaker.lock().await.accepted_challenge(&event);
+                if was_our_outbound {
+                    let tally = daily_counter.lock().await.increment();
+                    debug!(game_id = %game_id, tally, "counted outbound bot game toward daily tally");
+                }
                 let li = li.clone();
                 let cfg = config.clone();
                 let profile = profile.clone();
@@ -545,6 +564,8 @@ async fn handle_challenge(
     config: &Arc<Config>,
     profile: &UserProfileType,
     state: &Arc<Mutex<BotState>>,
+    matchmaker: &Arc<Mutex<Matchmaking>>,
+    daily_counter: &Arc<Mutex<DailyCounter>>,
 ) {
     let challenge = Challenge::from_info(&info, profile);
 
@@ -558,6 +579,23 @@ async fn handle_challenge(
         debug!(challenge_id = %challenge.id, "own outgoing challenge event, ignoring");
         return;
     }
+
+    // Reciprocity (communal engine development): a bot that has
+    // accepted one of *our* outbound matchmaking challenges (a game started)
+    // is welcomed back regardless of rating — we challenge bots down to
+    // ~our_rating-1000, so it's inconsistent to turn the same bot away at the
+    // 2200 incoming floor when it challenges us. Only the rating gate is
+    // waived; every other filter (block-lists, variant, noBot, concurrency,
+    // daily budget) still applies. Looked up in the matchmaker's persistent
+    // opponent database; locked and released before the state lock below.
+    let rating_exempt = if challenge.challenger.is_bot {
+        matchmaker
+            .lock()
+            .await
+            .bot_accepted_our_challenge(&challenge.challenger.name)
+    } else {
+        false
+    };
 
     // Global concurrency gate: separate from per-opponent engagement
     // (which `Challenge::is_supported` already enforces). We honour
@@ -576,6 +614,7 @@ async fn handle_challenge(
             &s.opponent_engagements,
             &s.online_blocklist,
             profile,
+            rating_exempt,
         );
         (active, supported)
     };
@@ -595,9 +634,40 @@ async fn handle_challenge(
         li.decline_challenge(&challenge.id, reason).await;
         return;
     }
+
+    // Daily bot-vs-bot budget gate (incoming side). Our best-effort mirror of
+    // Lichess' 100/day cap, declining *bot* challenges once the tally reaches
+    // `daily_game_limit - reserved_for_matchmaking` so a flood of incoming
+    // (often casual, weak) bots can't eat the whole quota and starve our own
+    // rated seeks. Human challengers never count toward the Lichess cap, so
+    // they bypass this entirely. `daily_game_limit == 0` disables the budget.
+    if challenge.challenger.is_bot && config.matchmaking.daily_game_limit > 0 {
+        let limit = config.matchmaking.daily_game_limit;
+        let reserved = config.matchmaking.reserved_for_matchmaking;
+        let count = daily_counter.lock().await.count();
+        if over_incoming_bot_budget(count, limit, reserved) {
+            info!(
+                challenge_id = %challenge.id,
+                count, limit, reserved,
+                threshold = limit.saturating_sub(reserved),
+                "declining incoming bot challenge: daily bot-game budget reached"
+            );
+            li.decline_challenge(&challenge.id, "later").await;
+            return;
+        }
+    }
+
     info!(challenge_id = %challenge.id, "accepting challenge");
     if let Err(e) = li.accept_challenge(&challenge.id).await {
         warn!(challenge_id = %challenge.id, "accept failed: {e}");
+    } else if challenge.challenger.is_bot {
+        // Count the accepted incoming bot game toward the daily tally. Counted
+        // here at accept time (the gameStart opponent object omits the title,
+        // so bot-ness can't be re-derived there); a rare accepted-but-aborted
+        // game over-counts by one, which is conservative and harmless given
+        // Lichess remains the hard enforcer.
+        let tally = daily_counter.lock().await.increment();
+        debug!(challenge_id = %challenge.id, tally, "counted incoming bot game toward daily tally");
     }
 }
 
@@ -610,6 +680,17 @@ pub fn concurrency_allows(active: usize, concurrency: u32) -> bool {
         return false;
     }
     active < concurrency as usize
+}
+
+/// Whether an incoming **bot** challenge must be declined to protect the daily
+/// bot-vs-bot budget. `count` is the current tally, `limit` our mirror of
+/// Lichess' 100/day cap, `reserved` the slice held back for self-sought
+/// matchmaking. Incoming bots are turned away once the tally reaches
+/// `limit - reserved`, leaving `reserved` games of headroom for our own seeks.
+/// Pure (no I/O) so the budget policy is unit-testable. Callers gate on
+/// `is_bot` and `limit > 0` before consulting this.
+pub fn over_incoming_bot_budget(count: u32, limit: u32, reserved: u32) -> bool {
+    count >= limit.saturating_sub(reserved)
 }
 
 // ---------------------------------------------------------------------------
@@ -1731,6 +1812,26 @@ mod tests {
     }
 
     #[test]
+    fn incoming_bot_budget_thresholds() {
+        // No reservation: incoming bots accepted right up to the limit, then
+        // turned away.
+        assert!(!over_incoming_bot_budget(0, 100, 0));
+        assert!(!over_incoming_bot_budget(99, 100, 0));
+        assert!(over_incoming_bot_budget(100, 100, 0));
+        assert!(over_incoming_bot_budget(101, 100, 0));
+
+        // Reserve 30 for matchmaking: incoming bots stop at 70, leaving 30
+        // headroom for our own seeks (which run up to the full 100).
+        assert!(!over_incoming_bot_budget(69, 100, 30));
+        assert!(over_incoming_bot_budget(70, 100, 30));
+
+        // reserved >= limit saturates to a zero threshold (decline all
+        // incoming bots) rather than underflowing.
+        assert!(over_incoming_bot_budget(0, 100, 100));
+        assert!(over_incoming_bot_budget(0, 100, 250));
+    }
+
+    #[test]
     fn json_value_to_string_renders_primitives() {
         assert_eq!(json_value_to_string(&JsonValue::Null), "");
         assert_eq!(json_value_to_string(&JsonValue::Bool(true)), "true");
@@ -2213,6 +2314,7 @@ mod tests {
                 &cfg,
                 UserProfileType { username: Some("us".into()), ..Default::default() },
                 crate::blocklist::OnlineBlocklist::default(),
+                Arc::new(tokio::sync::Mutex::new(crate::daily_counter::DailyCounter::load(""))),
             );
             let matchmaker = Arc::new(tokio::sync::Mutex::new(mm));
 

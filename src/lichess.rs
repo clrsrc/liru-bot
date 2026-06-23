@@ -699,6 +699,13 @@ impl Lichess {
         let opp_rate_limited =
             status == StatusCode::BAD_REQUEST && is_daily_game_rate_limit(&challenge);
 
+        // A real generic account throttle: HTTP 429 that is NOT the daily-vs-bot limit.
+        // Content declines (onlyFriends, variant/rating mismatch, …) arrive with a
+        // non-429 status, so this stays false for them — letting matchmaking skip the
+        // opponent instead of pausing the whole account. (locale-independent signal)
+        challenge.account_throttled_429 =
+            Some(status == StatusCode::TOO_MANY_REQUESTS && !is_daily_game_rate_limit(&challenge));
+
         if bot_rate_limited || opp_rate_limited {
             let delay = challenge
                 .ratelimit

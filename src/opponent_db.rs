@@ -17,6 +17,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
@@ -87,6 +88,14 @@ pub struct OpponentRecord {
     /// Permanent "does not play bots" flag — never challenge again.
     #[serde(default)]
     pub no_bots: bool,
+    /// Epoch-seconds (local clock) until which this opponent is rate-limited
+    /// against *our* outbound challenges — set from Lichess' `rate_limit_timeout`
+    /// on an `opponent_is_rate_limited` challenge error (e.g. the opponent hit
+    /// their own 100-bot-games/day cap). Persisted so a bot restart does not
+    /// re-challenge every capped opponent in a burst (which trips Lichess'
+    /// "Too many requests" 429 storm).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limited_until: Option<i64>,
     /// Capped event timeline, newest last.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub history: Vec<HistoryEntry>,
@@ -180,6 +189,53 @@ impl OpponentDb {
         self.records.values().filter(|r| r.no_bots).count()
     }
 
+    /// All decline events from the last `within` duration, with the remaining
+    /// cooldown time. Used by [`crate::matchmaking::Matchmaking::new`] to
+    /// restore in-memory suppressions across restarts and avoid a post-restart
+    /// challenge burst (429 root cause).
+    ///
+    /// Returns `(username, reason_key, remaining_cooldown, last_form)`.
+    /// Entries where the cooldown has already expired are omitted. The
+    /// `noBot` / `onlyBot` decline reasons are also excluded — those are
+    /// covered by the permanent [`OpponentRecord::no_bots`] flag.
+    pub fn recent_declines(&self, within: Duration) -> Vec<(String, String, Duration, ChallengeForm)> {
+        let now = chrono::Local::now();
+        let within_chrono = match chrono::Duration::from_std(within) {
+            Ok(d) => d,
+            Err(_) => return Vec::new(),
+        };
+        let cutoff = now - within_chrono;
+
+        let mut out = Vec::new();
+        for (username, rec) in &self.records {
+            for entry in &rec.history {
+                let Some(reason_key) = entry.event.strip_prefix("declined:") else {
+                    continue;
+                };
+                if matches!(reason_key, "nobot" | "onlybot") {
+                    continue;
+                }
+                let at = match chrono::DateTime::parse_from_rfc3339(&entry.at) {
+                    Ok(dt) => dt.with_timezone(&chrono::Local),
+                    Err(_) => continue,
+                };
+                if at <= cutoff {
+                    continue;
+                }
+                let elapsed = match now.signed_duration_since(at).to_std() {
+                    Ok(d) => d,
+                    Err(_) => continue, // future timestamp — skip
+                };
+                let remaining = within.saturating_sub(elapsed);
+                if remaining.is_zero() {
+                    continue;
+                }
+                out.push((username.clone(), reason_key.to_string(), remaining, entry.form.clone()));
+            }
+        }
+        out
+    }
+
     /// How many challenges we have *initiated* against `username` so far today
     /// (local calendar day). Drives the matchmaking diversity brake so we don't
     /// farm a single opponent. Counts `challenged` history events whose
@@ -248,6 +304,26 @@ impl OpponentDb {
         self.save();
     }
 
+    /// Record that `username` is rate-limited against our outbound challenges
+    /// for `timeout_secs` from now (e.g. they hit their own daily bot-games
+    /// cap). Persisted so the suppression survives a restart.
+    pub fn record_rate_limited(&mut self, username: &str, timeout_secs: i64) {
+        let until = now_epoch().saturating_add(timeout_secs.max(0));
+        let rec = self.records.entry(username.to_string()).or_default();
+        rec.rate_limited_until = Some(until);
+        self.save();
+    }
+
+    /// Whether `username` is currently rate-limited against our outbound
+    /// challenges (persisted across restarts). Stale entries (timestamp in the
+    /// past) read as not-limited; unknown opponents read as not-limited.
+    pub fn is_rate_limited(&self, username: &str) -> bool {
+        self.records
+            .get(username)
+            .and_then(|r| r.rate_limited_until)
+            .map_or(false, |until| until > now_epoch())
+    }
+
     /// Atomically persist to disk (temp file in the same directory + rename).
     /// Errors are logged but never propagated — a failed write must not crash
     /// the bot or interrupt matchmaking.
@@ -290,6 +366,11 @@ fn now_rfc3339() -> String {
 /// [`now_rfc3339`], so the diversity brake compares like for like.
 fn today_local() -> String {
     chrono::Local::now().format("%Y-%m-%d").to_string()
+}
+
+/// Current local time as epoch seconds — for rate-limit expiry comparisons.
+fn now_epoch() -> i64 {
+    chrono::Local::now().timestamp()
 }
 
 // ---------------------------------------------------------------------------
@@ -419,6 +500,35 @@ mod tests {
     }
 
     #[test]
+    fn recent_declines_returns_only_fresh_non_nobot_entries() {
+        let mut db = OpponentDb::load("");
+
+        // BotA: "later" decline ~1h ago → should appear with ~23h remaining.
+        db.record_challenge_sent("BotA", form("casual"));
+        db.record_declined("BotA", "later");
+        let one_hour_ago = (chrono::Local::now() - chrono::Duration::hours(1)).to_rfc3339();
+        db.records.get_mut("BotA").unwrap().history.last_mut().unwrap().at = one_hour_ago;
+
+        // BotB: "toofast" decline 25h ago → outside the 24h window, must be absent.
+        db.record_challenge_sent("BotB", form("rated"));
+        db.record_declined("BotB", "toofast");
+        let old = (chrono::Local::now() - chrono::Duration::hours(25)).to_rfc3339();
+        db.records.get_mut("BotB").unwrap().history.last_mut().unwrap().at = old;
+
+        // BotC: "nobot" → permanent block, excluded from recent_declines output.
+        db.record_challenge_sent("BotC", form("casual"));
+        db.record_declined("BotC", "nobot");
+
+        let recent = db.recent_declines(Duration::from_secs(24 * 3600));
+        assert_eq!(recent.len(), 1, "only BotA's 'later' decline should be returned");
+        let (name, reason, remaining, _f) = &recent[0];
+        assert_eq!(name, "BotA");
+        assert_eq!(reason, "later");
+        assert!(remaining.as_secs() > 22 * 3600, "~23h remaining expected");
+        assert!(remaining.as_secs() <= 24 * 3600);
+    }
+
+    #[test]
     fn history_is_capped() {
         let path = temp_path("history_cap");
         let mut db = OpponentDb::load(&path);
@@ -426,6 +536,33 @@ mod tests {
             db.record_challenge_sent("SpamBot", form("casual"));
         }
         assert_eq!(db.get("SpamBot").unwrap().history.len(), MAX_HISTORY);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn rate_limited_until_set_query_and_expiry() {
+        let mut db = OpponentDb::load(""); // in-memory
+        // Unknown opponent → not limited.
+        assert!(!db.is_rate_limited("Weiawaga"));
+        // Future timeout → limited.
+        db.record_rate_limited("Weiawaga", 3600);
+        assert!(db.is_rate_limited("Weiawaga"));
+        // A past timeout (already elapsed) → not limited.
+        db.record_rate_limited("Weiawaga", -10);
+        assert!(!db.is_rate_limited("Weiawaga"));
+    }
+
+    #[test]
+    fn rate_limited_persists_across_reload() {
+        let path = temp_path("rate_limited_persist");
+        {
+            let mut db = OpponentDb::load(&path);
+            db.record_rate_limited("CappedBot", 3600);
+        }
+        // A fresh load (simulating a restart) still sees the suppression →
+        // no re-challenge burst on restart.
+        let db = OpponentDb::load(&path);
+        assert!(db.is_rate_limited("CappedBot"));
         let _ = std::fs::remove_file(&path);
     }
 }

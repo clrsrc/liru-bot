@@ -173,6 +173,11 @@ pub struct ChallengeType {
     #[serde(default, skip_serializing_if = "Option::is_none")] pub bot_is_rate_limited: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub opponent_is_rate_limited: Option<bool>,
     #[serde(default, skip)] pub rate_limit_timeout: Option<Duration>,
+    // Set by `Lichess::challenge`: HTTP 429 that is NOT a daily-game limit = a real
+    // generic account throttle (vs. a content decline like onlyFriends, which arrives
+    // here with a non-429 status). Locale-independent signal so matchmaking can tell a
+    // true account-429 (→ escalating backoff) from an opponent decline (→ skip opponent).
+    #[serde(default, skip)] pub account_throttled_429: Option<bool>,
 }
 
 /// First-move abort timer from the game stream (`gameState.expiration`).

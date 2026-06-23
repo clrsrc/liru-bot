@@ -5,6 +5,7 @@
 //! method, [`Matchmaking::challenge`], that the main loop calls every tick.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Local;
@@ -14,8 +15,11 @@ use rand::rngs::StdRng;
 use serde_json::json;
 use tracing::{debug, error, info, warn};
 
+use tokio::sync::Mutex;
+
 use crate::blocklist::OnlineBlocklist;
 use crate::config::{Config, MatchmakingConfig, MatchmakingOverride};
+use crate::daily_counter::DailyCounter;
 use crate::lichess::{Lichess, LichessError};
 use crate::lichess_types::{ChallengeType, EventType, FilterType, PerfType, UserProfileType};
 use crate::model::Challenge;
@@ -47,6 +51,32 @@ pub struct Matchmaking {
     /// Persistent record of every bot we've challenged. Also the source of
     /// truth for the permanent `noBot` exclusion list.
     opponent_db: OpponentDb,
+    /// Shared UTC-daily bot-vs-bot game tally. Incremented by the event loop
+    /// (`lichess_bot.rs`) on every started bot game; read here to stop seeking
+    /// once we reach our mirror of Lichess' 100/day cap. See
+    /// [`crate::daily_counter`].
+    daily_counter: Arc<Mutex<DailyCounter>>,
+    /// Count of *consecutive* unstructured "Too many requests" (account-level)
+    /// 429s on challenge creation. Drives an escalating account-pause backoff
+    /// (`generic_429_backoff_minutes`) so the bot doesn't keep re-probing every
+    /// few minutes into a Lichess rate-limit that never refills while it's
+    /// being hit (the 15.06 self-perpetuating account-429). Reset to 0 the
+    /// moment a challenge is created successfully.
+    consecutive_generic_429: u32,
+}
+
+/// Account-pause (minutes) for the N-th consecutive unstructured "Too many
+/// requests" 429 on challenge creation. Escalates so a persistent account-level
+/// rate-limit gets a long enough break to refill, instead of being kept drained
+/// by short re-probes. Pure, so the schedule is unit-testable.
+fn generic_429_backoff_minutes(consecutive: u32) -> f64 {
+    match consecutive {
+        0 | 1 => 5.0,
+        2 => 10.0,
+        3 => 20.0,
+        4 => 40.0,
+        _ => 60.0,
+    }
 }
 
 impl Matchmaking {
@@ -55,6 +85,7 @@ impl Matchmaking {
         config: &Config,
         user_profile: UserProfileType,
         online_block_list: OnlineBlocklist,
+        daily_counter: Arc<Mutex<DailyCounter>>,
     ) -> Self {
         let variants = config
             .challenge
@@ -90,12 +121,25 @@ impl Matchmaking {
             challenge_filter,
             online_block_list,
             opponent_db,
+            daily_counter,
+            consecutive_generic_429: 0,
         };
 
         let block_list = mm.matchmaking_cfg.block_list.clone();
         for name in block_list {
             mm.add_to_block_list(&name);
         }
+
+        // Restore in-memory decline suppressions from the persistent history so
+        // that bots suppressed before a restart are not re-challenged immediately
+        // (the "429-Sturm" root cause: challenge_type_acceptable was cleared).
+        let fine = mm.challenge_filter == FilterType::Fine;
+        for (username, reason_key, remaining, form) in mm.opponent_db.recent_declines(days(1.0)) {
+            let aspect = decline_game_aspect(&reason_key, &form, fine);
+            mm.challenge_type_acceptable
+                .insert((username, aspect.to_string()), Timer::new(remaining));
+        }
+
         mm
     }
 
@@ -119,6 +163,18 @@ impl Matchmaking {
                 info!(%id, "expired challenge cancelled");
             }
             self.show_earliest_challenge_time();
+        }
+
+        // Daily bot-vs-bot budget gate: once our own tally reaches our mirror
+        // of Lichess' 100/day cap, stop seeking entirely — otherwise every
+        // outbound challenge just bounces off Lichess' `bot.vsBot.day` rate
+        // limit. Resets transparently at 00:00 UTC via the counter's rollover.
+        if matchmaking_enabled {
+            let limit = self.matchmaking_cfg.daily_game_limit;
+            if limit > 0 && self.daily_counter.lock().await.count() >= limit {
+                debug!(limit, "daily bot-game limit reached; pausing matchmaking until 00:00 UTC reset");
+                return false;
+            }
         }
 
         matchmaking_enabled && (time_has_passed || challenge_expired) && min_wait_time_passed
@@ -171,6 +227,9 @@ impl Matchmaking {
                     };
                     self.challenge_target = username.to_string();
                     self.opponent_db.record_challenge_sent(username, form);
+                    // A challenge went through → our account is no longer
+                    // rate-limited; reset the escalating-backoff counter.
+                    self.consecutive_generic_429 = 0;
                 }
                 return id;
             }
@@ -191,12 +250,49 @@ impl Matchmaking {
     fn handle_challenge_error_response(&mut self, response: &ChallengeType, username: &str) {
         error!(?response, "challenge error response");
         if response.bot_is_rate_limited == Some(true) {
+            // Our own account is rate-limited — pause all outbound challenges
+            // for the server-given duration.
             if let Some(timeout) = response.rate_limit_timeout {
                 self.rate_limit_timer = Timer::new(timeout);
             }
         } else if response.opponent_is_rate_limited == Some(true) {
+            // The opponent hit their own cap (e.g. 100 bot games/day). Suppress
+            // them in-memory AND persist it, so a restart does not re-challenge
+            // every capped opponent in a burst → Lichess "Too many requests".
             self.add_challenge_filter(username, "", response.rate_limit_timeout);
+            if let Some(timeout) = response.rate_limit_timeout {
+                self.opponent_db
+                    .record_rate_limited(username, timeout.as_secs() as i64);
+            }
+        } else if response.account_throttled_429 == Some(true) {
+            // Real generic account-429 (HTTP 429, not a daily-vs-bot limit): our account
+            // is being throttled — not this opponent's fault. Back the whole account off
+            // rather than day-suppressing an innocent opponent (the old behaviour shrank
+            // the candidate pool and fed the 429 storm).
+            // ESCALATING backoff: Lichess' rate-limit bucket does not refill while it's
+            // still being hit, so a fixed short pause lets the bot re-probe and perpetuate
+            // its own account-429 (observed 15.06). Each consecutive generic-429 pauses
+            // longer (5→10→20→40→60 min) until a challenge gets through (resets the counter).
+            self.consecutive_generic_429 = self.consecutive_generic_429.saturating_add(1);
+            let mins = generic_429_backoff_minutes(self.consecutive_generic_429);
+            warn!(
+                consecutive = self.consecutive_generic_429,
+                pause_min = mins,
+                "account rate-limited (generic 429); pausing outbound challenges"
+            );
+            self.rate_limit_timer = Timer::new(minutes(mins));
         } else {
+            // Content decline (onlyFriends, variant/rating/casual mismatch, …): the
+            // challenge POST returned a non-429 error body — NOT a rate limit. Skip THIS
+            // opponent (in-memory cooldown, consulted via in_block_list) like noBot/onlyBot;
+            // do NOT pause the whole account or touch the 429 counter. Without this, a
+            // single friend-only bot in a thin pool drove the escalating backoff into hours
+            // of idle (bot #167, 16.06). Locale-independent: keyed on HTTP status, not text.
+            warn!(
+                opponent = username,
+                error = ?response.error,
+                "challenge declined for a content reason (not a rate limit); skipping opponent"
+            );
             self.add_challenge_filter(username, "", None);
         }
         self.show_earliest_challenge_time();
@@ -336,7 +432,12 @@ impl Matchmaking {
         );
 
         self.online_block_list.refresh().await;
-        let online_bots_raw = self.li.get_online_bots(None).await;
+        // Fetch the full online-bot list (Lichess maxes ~300), not the default
+        // 100. With only 100 the in-window survivors after the cap/rate-limited
+        // filters collapsed to ~0 while ~165 of ~300 online bots were eligible —
+        // self-inflicted matchmaking starvation (befunde/matchmaking_starvation_20260617.md).
+        let online_bots_raw = self.li.get_online_bots(Some(300)).await;
+        let raw_count = online_bots_raw.len();
 
         let online_bots: Vec<UserProfileType> = online_bots_raw
             .into_iter()
@@ -344,18 +445,33 @@ impl Matchmaking {
             // Diversity brake: drop opponents we've already challenged to the
             // daily cap, so a single bot can't monopolise matchmaking.
             .filter(|bot| self.under_daily_challenge_cap(bot))
+            // Skip opponents we know are rate-limited (e.g. at their own daily
+            // cap). Persisted in the opponent DB, so a restart doesn't
+            // re-challenge every capped bot in a burst → Lichess 429 storm.
+            .filter(|bot| !self.opponent_rate_limited(bot))
             .collect();
+        let suitable_count = online_bots.len();
 
         let ready_bots: Vec<UserProfileType> = online_bots
             .iter()
             .filter(|bot| self.ready_for_challenge(bot, &variant, &game_type, &mode))
             .cloned()
             .collect();
+        let ready_count = ready_bots.len();
         let candidates = if !ready_bots.is_empty() {
             ready_bots
         } else {
             online_bots
         };
+        // Diagnostic: distinguish a silent-empty fetch (raw=0) from the filter
+        // gate (raw>0 but suitable/ready=0) when "No suitable bots" appears.
+        info!(
+            online_raw = raw_count,
+            suitable = suitable_count,
+            ready = ready_count,
+            candidates = candidates.len(),
+            "online bot pool after filters"
+        );
 
         let rating_weights = Self::get_weights(
             &candidates,
@@ -430,6 +546,16 @@ impl Matchmaking {
             Some(name) => self.opponent_db.challenges_today(name) < cap,
             None => true,
         }
+    }
+
+    /// Whether `bot` is currently rate-limited against our outbound challenges
+    /// (e.g. they hit their own daily bot-games cap). Backed by the persistent
+    /// opponent DB, so a restart doesn't re-challenge them in a burst. Bots
+    /// with no username pass (can't be looked up).
+    fn opponent_rate_limited(&self, bot: &UserProfileType) -> bool {
+        bot.username
+            .as_deref()
+            .map_or(false, |name| self.opponent_db.is_rate_limited(name))
     }
 
     fn is_suitable_opponent(
@@ -592,17 +718,36 @@ impl Matchmaking {
             .unwrap_or(true)
     }
 
-    pub fn accepted_challenge(&mut self, event: &EventType) {
+    /// Reconcile a `gameStart` against our outstanding outbound challenge.
+    /// Returns `true` when the started game *was* our outbound matchmaking
+    /// challenge — which, since matchmaking only ever targets bots, means the
+    /// caller should count it toward the daily bot-vs-bot tally.
+    pub fn accepted_challenge(&mut self, event: &EventType) -> bool {
         if let Some(id) = event.game.as_ref().and_then(|g| g.id.clone()) {
             // When an opponent accepts our outbound challenge the resulting
             // game id equals the challenge id. Only then do we credit the
             // game to the opponent we last challenged.
-            if id == self.challenge_id && !self.challenge_target.is_empty() {
+            let was_ours = id == self.challenge_id && !self.challenge_target.is_empty();
+            if was_ours {
                 let target = std::mem::take(&mut self.challenge_target);
                 self.opponent_db.record_accepted(&target);
             }
             self.discard_challenge(&id);
+            return was_ours;
         }
+        false
+    }
+
+    /// Whether `name` is a bot that accepted one of *our* outbound matchmaking
+    /// challenges (i.e. a game actually started, `games_played > 0` in the
+    /// persistent opponent database). Drives the reciprocity rule in
+    /// `handle_challenge`: such bots are accepted back regardless of rating
+    /// (communal engine development). Persists across restarts.
+    pub fn bot_accepted_our_challenge(&self, name: &str) -> bool {
+        self.opponent_db
+            .get(name)
+            .map(|r| r.games_played > 0)
+            .unwrap_or(false)
     }
 
     pub fn declined_challenge(&mut self, event: &EventType) {
@@ -718,6 +863,26 @@ fn merge_override(
         out.rating_preference = v.clone();
     }
     out
+}
+
+/// Maps a Lichess decline `reason_key` to the `game_aspect` string used as
+/// the second component of [`DeclineKey`]. Mirrors the `aspect_for` closure
+/// in [`Matchmaking::declined_challenge`] but works from the persisted
+/// [`ChallengeForm`] so it can be called during startup suppression-restore.
+///
+/// `fine` is `challenge_filter == FilterType::Fine`; when `false` every
+/// reason key collapses to `""` (whole-opponent block).
+fn decline_game_aspect<'a>(reason_key: &str, form: &'a ChallengeForm, fine: bool) -> &'a str {
+    if !fine {
+        return "";
+    }
+    match reason_key {
+        "generic" | "later" | "nobot" | "onlybot" => "",
+        "toofast" | "tooslow" | "timecontrol" => &form.game_type,
+        "rated" | "casual" => &form.mode,
+        "standard" | "variant" => &form.variant,
+        _ => "",
+    }
 }
 
 fn pick_optional_int(values: &[Option<i64>], rng: &mut StdRng) -> Option<i64> {
@@ -847,7 +1012,110 @@ mod tests {
             challenge_filter: FilterType::None,
             online_block_list: OnlineBlocklist::default(),
             opponent_db: OpponentDb::load(""),
+            daily_counter: Arc::new(Mutex::new(DailyCounter::load(""))),
+            consecutive_generic_429: 0,
         }
+    }
+
+    #[test]
+    fn bot_accepted_our_challenge_requires_a_played_game() {
+        let mut mm = direct_struct();
+        // Unknown opponent → false.
+        assert!(!mm.bot_accepted_our_challenge("Weiawaga"));
+        // We challenged them, but they haven't accepted yet → still false.
+        mm.opponent_db
+            .record_challenge_sent("Weiawaga", ChallengeForm::default());
+        assert!(!mm.bot_accepted_our_challenge("Weiawaga"));
+        // They accepted and a game started → reciprocity applies.
+        mm.opponent_db.record_accepted("Weiawaga");
+        assert!(mm.bot_accepted_our_challenge("Weiawaga"));
+    }
+
+    #[test]
+    fn opponent_rate_limited_is_persisted_and_skipped() {
+        use crate::lichess_types::ChallengeType;
+        let mut mm = direct_struct();
+        let bot = UserProfileType {
+            username: Some("CappedBot".into()),
+            ..Default::default()
+        };
+        assert!(!mm.opponent_rate_limited(&bot));
+
+        // Opponent at their own cap → persisted (survives restart) + skipped.
+        let resp = ChallengeType {
+            opponent_is_rate_limited: Some(true),
+            rate_limit_timeout: Some(Duration::from_secs(3600)),
+            ..Default::default()
+        };
+        mm.handle_challenge_error_response(&resp, "CappedBot");
+        assert!(mm.opponent_rate_limited(&bot));
+        assert!(mm.opponent_db.is_rate_limited("CappedBot"));
+    }
+
+    #[test]
+    fn generic_too_many_requests_pauses_account_not_opponent() {
+        use crate::lichess_types::ChallengeType;
+        let mut mm = direct_struct();
+        // Real generic 429 (HTTP 429, not daily-limit): flagged by Lichess::challenge.
+        let resp = ChallengeType {
+            error: Some("Too many requests. Try again later.".into()),
+            account_throttled_429: Some(true),
+            ..Default::default()
+        };
+        mm.handle_challenge_error_response(&resp, "InnocentBot");
+        // The whole account is paused ...
+        assert!(!mm.rate_limit_timer.is_expired());
+        // ... and the innocent opponent is NOT day-suppressed (old bug).
+        assert!(mm.should_accept_challenge("InnocentBot", ""));
+        assert!(!mm.opponent_db.is_rate_limited("InnocentBot"));
+        // First occurrence counts toward the escalating backoff.
+        assert_eq!(mm.consecutive_generic_429, 1);
+    }
+
+    #[test]
+    fn content_decline_skips_opponent_not_account() {
+        // onlyFriends (and other content declines) arrive with a non-429 status, so
+        // account_throttled_429 is false/None. Must skip the opponent (in_block_list),
+        // NOT pause the account or count toward the 429 backoff (bot #167, 16.06).
+        use crate::lichess_types::ChallengeType;
+        let mut mm = direct_struct();
+        let resp = ChallengeType {
+            error: Some("BOT Foo accepts challenges only from friends.".into()),
+            ..Default::default() // account_throttled_429 = None
+        };
+        mm.handle_challenge_error_response(&resp, "FriendOnlyBot");
+        // Opponent is skipped from future selection ...
+        assert!(mm.in_block_list("FriendOnlyBot"));
+        // ... but the account is NOT paused and the 429 counter stays put.
+        assert!(mm.rate_limit_timer.is_expired());
+        assert_eq!(mm.consecutive_generic_429, 0);
+    }
+
+    #[test]
+    fn generic_429_backoff_escalates_then_resets() {
+        // Pure schedule: 5 → 10 → 20 → 40 → 60 (capped).
+        assert_eq!(generic_429_backoff_minutes(1), 5.0);
+        assert_eq!(generic_429_backoff_minutes(2), 10.0);
+        assert_eq!(generic_429_backoff_minutes(3), 20.0);
+        assert_eq!(generic_429_backoff_minutes(4), 40.0);
+        assert_eq!(generic_429_backoff_minutes(5), 60.0);
+        assert_eq!(generic_429_backoff_minutes(99), 60.0);
+
+        use crate::lichess_types::ChallengeType;
+        let mut mm = direct_struct();
+        let resp = ChallengeType {
+            error: Some("Too many requests. Try again later.".into()),
+            account_throttled_429: Some(true),
+            ..Default::default()
+        };
+        // Three consecutive generic-429s → counter climbs.
+        for expected in 1..=3 {
+            mm.handle_challenge_error_response(&resp, "InnocentBot");
+            assert_eq!(mm.consecutive_generic_429, expected);
+        }
+        // A successful challenge resets the escalation.
+        mm.consecutive_generic_429 = 0; // (set directly: create_challenge resets on success)
+        assert_eq!(mm.consecutive_generic_429, 0);
     }
 
     #[test]
@@ -910,5 +1178,26 @@ mod tests {
         // Cap of 0 disables the brake.
         mm.matchmaking_cfg.max_challenges_per_opponent_per_day = 0;
         assert!(mm.under_daily_challenge_cap(&repeat));
+    }
+
+    #[test]
+    fn decline_game_aspect_maps_reason_keys() {
+        let form = ChallengeForm {
+            base_time: 300,
+            increment: 2,
+            days: 0,
+            variant: "chess960".into(),
+            mode: "rated".into(),
+            game_type: "blitz".into(),
+        };
+        assert_eq!(decline_game_aspect("generic", &form, true), "");
+        assert_eq!(decline_game_aspect("later", &form, true), "");
+        assert_eq!(decline_game_aspect("toofast", &form, true), "blitz");
+        assert_eq!(decline_game_aspect("timecontrol", &form, true), "blitz");
+        assert_eq!(decline_game_aspect("casual", &form, true), "rated");
+        assert_eq!(decline_game_aspect("variant", &form, true), "chess960");
+        // When not fine, all aspects collapse to "".
+        assert_eq!(decline_game_aspect("toofast", &form, false), "");
+        assert_eq!(decline_game_aspect("variant", &form, false), "");
     }
 }

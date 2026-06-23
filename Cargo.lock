@@ -290,8 +290,8 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "clrsrc"
-version = "1.1.1"
-source = "git+https://github.com/clrsrc/clrsrc?tag=v1.1.1#51e14671b691264f857891e405018b38a5becdd2"
+version = "1.2.0"
+source = "git+https://github.com/clrsrc/clrsrc?tag=v1.2.0#0ce22c00aeb8521e01aa88d16c5ec15f70b90800"
 dependencies = [
  "shakmaty",
  "shakmaty-syzygy",
@@ -982,7 +982,7 @@ checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
 name = "liru-bot"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",

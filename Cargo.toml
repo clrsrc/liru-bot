@@ -1,6 +1,6 @@
 [package]
 name = "liru-bot"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 authors = ["Stefan Kammann", "lichess-bot contributors (Python original)"]
 description = "LiRu-Bot — a bridge between the Lichess Bot API and chess engines. Rust port of lichess-bot."
@@ -43,15 +43,15 @@ thiserror = "1.0"
 
 # In-process clrsrc engine, behind the optional `embedded` feature. Embedded API
 # contract: see clrsrc's EMBEDDED.md
-# (https://github.com/clrsrc/clrsrc/blob/v1.1.1/EMBEDDED.md).
+# (https://github.com/clrsrc/clrsrc/blob/v1.2.0/EMBEDDED.md).
 #
 # The DEFAULT (subprocess) build never compiles clrsrc and keeps its GPL out of
-# the default artifact. Pinned to tag v1.1.1 for reproducibility and a stable
-# AGPL §6 / GPL §6 Corresponding Source (clrsrc @ v1.1.1). NOTE: Cargo resolves
+# the default artifact. Pinned to tag v1.2.0 for reproducibility and a stable
+# AGPL §6 / GPL §6 Corresponding Source (clrsrc @ v1.2.0). NOTE: Cargo resolves
 # every optional dependency's manifest at lock time, so a default build needs
 # network to read clrsrc's manifest — but it does not compile or download
 # clrsrc itself unless `--features embedded` is set.
-clrsrc = { git = "https://github.com/clrsrc/clrsrc", tag = "v1.1.1", optional = true }
+clrsrc = { git = "https://github.com/clrsrc/clrsrc", tag = "v1.2.0", optional = true }
 # Local embedded development without network: override the line above with a
 # sibling checkout instead —
 # clrsrc = { path = "../clrsrc", optional = true }

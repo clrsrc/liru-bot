@@ -263,6 +263,7 @@ impl Challenge {
         opponent_engagements: &HashMap<String, u32>,
         online_block_list: &OnlineBlocklist,
         user_profile: &UserProfileType,
+        rating_exempt: bool,
     ) -> (bool, &'static str) {
         if self.from_self {
             return (true, "");
@@ -296,7 +297,7 @@ impl Challenge {
             .or_else(|| reject(self.is_supported_time_control(cfg), "timeControl"))
             .or_else(|| reject(self.is_supported_variant(cfg), "variant"))
             .or_else(|| reject(self.is_supported_mode(cfg), mode_label))
-            .or_else(|| reject(self.is_supported_rating(cfg, user_profile), "generic"))
+            .or_else(|| reject(rating_exempt || self.is_supported_rating(cfg, user_profile), "generic"))
             .or_else(|| reject(
                 !cfg.block_list.iter().any(|b| b == &self.challenger.name),
                 "generic",
@@ -635,6 +636,65 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(format!("{p}"), "AI level 5");
+    }
+
+    #[test]
+    fn is_supported_rating_exemption_waives_floor_for_known_bot() {
+        use crate::lichess_types::PlayerType;
+        use std::collections::HashMap;
+
+        // Permissive casual-standard-blitz config with a 2200 incoming floor.
+        let cfg: ChallengeConfig = serde_json::from_value(serde_json::json!({
+            "accept_bot": true,
+            "variants": ["standard"],
+            "time_controls": ["blitz"],
+            "modes": ["casual"],
+            "min_rating": 2200,
+        }))
+        .unwrap();
+
+        // A bot challenger rated 1600 — below the 2200 floor.
+        let challenger = Player::new(&PlayerType {
+            title: Some("BOT".into()),
+            name: Some("weakbot".into()),
+            rating: Some(1600),
+            ..Default::default()
+        });
+        let challenge = Challenge {
+            id: "x".into(),
+            rated: false,
+            variant: "standard".into(),
+            perf_name: "blitz".into(),
+            speed: "blitz".into(),
+            increment: Some(2),
+            base: Some(300),
+            days: None,
+            challenger,
+            challenge_target: Player::new(&PlayerType::default()),
+            from_self: false,
+            initial_fen: "startpos".into(),
+            color: String::new(),
+            time_control: None,
+        };
+
+        let mut recent: HashMap<String, Vec<Timer>> = HashMap::new();
+        let engagements: HashMap<String, u32> = HashMap::new();
+        let blocklist = OnlineBlocklist::default();
+        let profile = UserProfileType::default();
+
+        // Not exempt → declined on rating (reason "generic").
+        let (ok, reason) = challenge.is_supported(
+            &cfg, &mut recent, &engagements, &blocklist, &profile, false,
+        );
+        assert!(!ok);
+        assert_eq!(reason, "generic");
+
+        // Exempt (a bot that accepted our challenge) → rating gate waived,
+        // challenge supported. Every other filter still ran and passed.
+        let (ok, _) = challenge.is_supported(
+            &cfg, &mut recent, &engagements, &blocklist, &profile, true,
+        );
+        assert!(ok);
     }
 
     /// Build a Bullet `Game` matching the fixture in

@@ -642,17 +642,24 @@ fn clamped_ms(value: Option<i64>) -> u64 {
     value.unwrap_or(0).max(0) as u64
 }
 
-/// Per-move overshoot cap in ms: `remaining / 30 + increment`.
+/// Per-move overshoot cap in ms: `remaining / 15 + increment`.
 ///
 /// BUS #3/#9/#10/#13 (Game EqGn5ie6): clrsrc's `stability_factor` can inflate
 /// the soft limit in flat, best-move-oscillating positions; on slow hardware the
 /// engine then runs a deep iteration toward the hard cap (126 s on a single move
-/// → forfeit). The engine-side fix (`SOFT_INFLATION_CAP`) was SPRT-rejected as
-/// ELO-neutral-negative, so this bot-side cap is the *only* overshoot protection.
-/// In normal play it is ~the engine's own per-move budget, so it binds only in
-/// the pathological case (clrsrc green-lit `min(soft, remaining/30 + inc)`).
+/// → forfeit). This bot-side cap is the absolute per-move overshoot protection.
+///
+/// TM-v1 (BUS #201, flat-defense fix): the divisor was `30` — but that made the
+/// cap *bind* clrsrc's `base_hard` in blitz/rapid, so clrsrc's own criticality
+/// escalation (`score_factor` 2.0×, `stability_factor` 2.5×) had zero headroom
+/// and could only shrink (befunde/flat_defense_time_20260617.md). Raised to `15`
+/// so the absolute ceiling is `remaining/15 + inc`: clrsrc's escalation now
+/// breathes up to it, normal moves still stop at clrsrc-soft. Forfeit-safety is
+/// structural — `max_deadline` is an absolute wall-clock instant and `remaining/15`
+/// survives 15 moves. Coupled with clrsrc's `SOFT_INFLATION_CAP 1.5→2.5`; both
+/// halves go live together (one half alone is re-clamped by the other's old bound).
 fn movetime_cap_ms(remaining_ms: u64, inc_ms: u64) -> u64 {
-    remaining_ms / 30 + inc_ms
+    remaining_ms / 15 + inc_ms
 }
 
 /// Number of half-moves already played, derived from the UCI `moves`
@@ -700,7 +707,7 @@ pub fn single_move_time(
     GoLimits::movetime(search_time.as_millis() as u64)
 }
 
-/// Realtime game: cap the search at `remaining/30 + inc` via `go movetime`.
+/// Realtime game: cap the search at `remaining/15 + inc` via `go movetime`.
 ///
 /// We used to ship the raw clocks and let the engine budget itself, but that
 /// left the overshoot class (see [`movetime_cap_ms`]) uncapped on the
@@ -807,6 +814,12 @@ pub struct DrawResignDecision {
 #[derive(Debug, Clone, Default)]
 pub struct DrawResignTracker {
     scores: Vec<PovScore>,
+    /// Whether we have already offered a draw during the current continuous
+    /// "draw phase" (flat eval near zero, low piece count). Re-armed once the
+    /// position leaves that phase, so each fresh draw phase yields exactly ONE
+    /// offer instead of one per move — repeatedly offering in a long dead-drawn
+    /// endgame is spammy and risks a Lichess etiquette flag.
+    draw_offered_in_phase: bool,
 }
 
 impl DrawResignTracker {
@@ -835,21 +848,33 @@ impl DrawResignTracker {
     /// `chess.popcount(board.occupied)`). The draw offer requires that
     /// `piece_count <= cfg.offer_draw_pieces` *and* the last
     /// `cfg.offer_draw_moves` scores all sit within `±cfg.offer_draw_score`.
-    pub fn decide(&self, cfg: &DrawOrResignConfig, piece_count: u32) -> DrawResignDecision {
+    pub fn decide(&mut self, cfg: &DrawOrResignConfig, piece_count: u32) -> DrawResignDecision {
         const MATE_SCORE: i64 = 40_000;
         let mut decision = DrawResignDecision::default();
 
-        if cfg.offer_draw_enabled
+        let in_draw_phase = cfg.offer_draw_enabled
             && self.scores.len() >= cfg.offer_draw_moves as usize
             && piece_count <= cfg.offer_draw_pieces
-        {
-            let window = &self.scores[self.scores.len() - cfg.offer_draw_moves as usize..];
-            let near_draw = window
-                .iter()
-                .all(|s| s.to_cp(MATE_SCORE).abs() <= cfg.offer_draw_score);
-            if near_draw {
+            && {
+                let window = &self.scores[self.scores.len() - cfg.offer_draw_moves as usize..];
+                window
+                    .iter()
+                    .all(|s| s.to_cp(MATE_SCORE).abs() <= cfg.offer_draw_score)
+            };
+
+        if in_draw_phase {
+            // Throttle: offer a draw only ONCE per continuous draw phase, not on
+            // every move. Repeatedly offering in a long dead-drawn endgame is
+            // spammy and risks a Lichess etiquette flag; the opponent can accept
+            // at any time, and the draw also arrives via repetition/agreement.
+            if !self.draw_offered_in_phase {
                 decision.offer_draw = true;
+                self.draw_offered_in_phase = true;
             }
+        } else {
+            // Left the draw phase (eval moved out of the window or pieces grew);
+            // re-arm so a later fresh draw phase yields one offer again.
+            self.draw_offered_in_phase = false;
         }
 
         if cfg.resign_enabled && self.scores.len() >= cfg.resign_moves as usize {
@@ -1449,7 +1474,7 @@ impl EngineLike for UciClient {
 // ---------------------------------------------------------------------------
 
 /// The time inputs the in-process embedded engine needs for one move
-/// (BOT_ENGINE_INTEGRATION_PLAN.md B3). The subprocess backend ignores this and
+/// (clrsrc's EMBEDDED.md B3). The subprocess backend ignores this and
 /// keeps using `game_clock_time`.
 ///
 /// The whole point: today the overhead is paid **twice** — `game_clock_time`
@@ -1547,7 +1572,7 @@ impl EmbeddedTiming {
 // ---------------------------------------------------------------------------
 
 /// The engine the bot drives for one game. The subprocess UCI client is the
-/// default; the in-process embedded clrsrc engine (BOT_ENGINE_INTEGRATION_PLAN.md
+/// default; the in-process embedded clrsrc engine (clrsrc's EMBEDDED.md
 /// B1) is opt-in behind the `embedded` feature and only selected for standard
 /// chess (clrsrc's FEN parser has no Chess960 castling). The bot loop holds one
 /// of these per game and forwards the same calls to whichever backend is active.
@@ -2156,7 +2181,7 @@ mod tests {
     fn second_move_uses_game_clock_in_realtime() {
         // 2 half-moves already played → next move is the 3rd, no longer
         // covered by the fixed "first move" budget. The realtime path now caps
-        // the search at remaining/30 + inc via `go movetime`.
+        // the search at remaining/15 + inc via `go movetime`.
         let state = state_with_moves("e2e4 e7e5", 300_000, 295_000, 2_000, 2_000);
         let (limits, can_ponder) = move_time(
             Side::White,
@@ -2167,10 +2192,10 @@ mod tests {
             false,
             Duration::ZERO,
         );
-        // 300000/30 + 2000 = 12000. The cap is derived from the raw clock, so
+        // 300000/15 + 2000 = 22000. The cap is derived from the raw clock, so
         // the tiny Timer drift doesn't move it (it only shrinks `avail`, which
         // stays far above the cap here).
-        assert_eq!(limits.movetime_ms, Some(12_000));
+        assert_eq!(limits.movetime_ms, Some(22_000));
         assert!(limits.wtime_ms.is_none());
         assert!(can_ponder);
     }
@@ -2178,19 +2203,19 @@ mod tests {
     #[test]
     fn game_clock_caps_movetime_per_side() {
         let state = state_with_moves("e2e4 e7e5", 300_000, 295_000, 2_000, 2_000);
-        // White: 300000/30 + 2000 = 12000.
+        // White: 300000/15 + 2000 = 22000.
         let w = game_clock_time(Side::White, &state, &Timer::zero(), Duration::from_millis(500));
-        assert_eq!(w.movetime_ms, Some(12_000));
+        assert_eq!(w.movetime_ms, Some(22_000));
         assert!(w.wtime_ms.is_none());
-        // Black: 295000/30 + 2000 = 11833 — the cap follows the side to move.
+        // Black: 295000/15 + 2000 = 21666 — the cap follows the side to move.
         let b = game_clock_time(Side::Black, &state, &Timer::zero(), Duration::from_millis(500));
-        assert_eq!(b.movetime_ms, Some(11_833));
+        assert_eq!(b.movetime_ms, Some(21_666));
     }
 
     #[test]
     fn game_clock_clamps_to_one_ms_when_overhead_exceeds_remaining() {
         // 50 ms left, 100 ms overhead → `avail` clamps to 1 ms, below the
-        // cap (50/30 = 1), so the movetime clamps to the 1 ms floor.
+        // cap (50/15 = 3), so the movetime clamps to the 1 ms floor.
         let state = state_with_moves("e2e4 e7e5", 50, 60_000, 0, 0);
         let limits = game_clock_time(
             Side::White,
@@ -2203,7 +2228,7 @@ mod tests {
 
     #[test]
     fn embedded_clock_mode_tightens_deadline_to_overshoot_cap() {
-        // Plenty of clock → the per-move cap (300000/30 + 2000 = 12000 ms), not
+        // Plenty of clock → the per-move cap (300000/15 + 2000 = 22000 ms), not
         // the flag-fall ceiling, is what bounds `max_deadline`. Raw clocks still
         // ride along untouched for clrsrc's own soft computation.
         let state = state_with_moves("e2e4 e7e5", 300_000, 295_000, 2_000, 2_000);
@@ -2219,8 +2244,8 @@ mod tests {
             .saturating_duration_since(std::time::Instant::now())
             .as_millis() as u64;
         assert!(
-            (11_900..=12_000).contains(&budget_ms),
-            "expected ~12000 ms cap, got {budget_ms}"
+            (21_900..=22_000).contains(&budget_ms),
+            "expected ~22000 ms cap, got {budget_ms}"
         );
         assert_eq!(t.wtime_ms, 300_000);
         assert_eq!(t.movetime_ms, 0);
@@ -2228,7 +2253,7 @@ mod tests {
 
     #[test]
     fn embedded_clock_mode_falls_back_to_flag_fall_in_scramble() {
-        // 5 s left, 300 ms overhead → cap would be 5000/30 = 166 ms, but the
+        // 5 s left, 300 ms overhead → cap would be 5000/15 = 333 ms, but the
         // flag-fall ceiling (5000 − 300 = 4700) is larger, so the cap binds.
         // Conversely with no increment and a near-flat clock the hard ceiling
         // is the smaller term and protects the flag.
@@ -2244,8 +2269,8 @@ mod tests {
             .max_deadline
             .saturating_duration_since(std::time::Instant::now())
             .as_millis() as u64;
-        // cap = 400/30 = 13 ms; hard = 400 − 300 = 100 ms → min = 13 ms.
-        assert!(budget_ms <= 13, "expected cap ≤13 ms, got {budget_ms}");
+        // cap = 400/15 = 26 ms; hard = 400 − 300 = 100 ms → min = 26 ms.
+        assert!(budget_ms <= 26, "expected cap ≤26 ms, got {budget_ms}");
     }
 
     #[test]
@@ -2354,6 +2379,32 @@ mod tests {
         let mut t = DrawResignTracker::new();
         t.record(PovScore::from_cp(0));
         t.record(PovScore::from_cp(500));
+        t.record(PovScore::from_cp(0));
+        assert!(!t.decide(&cfg, 8).offer_draw);
+    }
+
+    #[test]
+    fn tracker_offers_draw_only_once_per_phase() {
+        let cfg = dor(true, 75, 3, 10, false, 0, 0);
+        let mut t = DrawResignTracker::new();
+        for _ in 0..3 {
+            t.record(PovScore::from_cp(0));
+        }
+        // First move in the draw phase → offers once.
+        assert!(t.decide(&cfg, 8).offer_draw);
+        // Still flat & low-piece on subsequent moves → does NOT re-offer.
+        t.record(PovScore::from_cp(0));
+        assert!(!t.decide(&cfg, 8).offer_draw);
+        t.record(PovScore::from_cp(10));
+        assert!(!t.decide(&cfg, 8).offer_draw);
+        // Eval leaves the draw window (we're winning) → phase ends, re-arm.
+        t.record(PovScore::from_cp(800));
+        assert!(!t.decide(&cfg, 8).offer_draw);
+        // A fresh flat draw phase later → offers exactly once again.
+        for _ in 0..3 {
+            t.record(PovScore::from_cp(0));
+        }
+        assert!(t.decide(&cfg, 8).offer_draw);
         t.record(PovScore::from_cp(0));
         assert!(!t.decide(&cfg, 8).offer_draw);
     }

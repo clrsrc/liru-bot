@@ -16,6 +16,7 @@
 pub mod blocklist;
 pub mod config;
 pub mod conversation;
+pub mod daily_counter;
 pub mod egtb;
 // In-process clrsrc engine backend (B1-B6). Only compiled with `--features
 // embedded`; the default subprocess build never references clrsrc.
