@@ -200,7 +200,36 @@ pub fn append_entries(path: impl AsRef<Path>, entries: &[Jbk2Entry]) -> io::Resu
         u64::from_le_bytes(header[8..16].try_into().unwrap())
     };
 
-    // Append the entries at the end of the file.
+    // Guard against a torn append: if the body isn't a whole number of
+    // ENTRY_SIZE records, a previous write was interrupted (process kill /
+    // disk-full) mid-entry. Appending blindly past it would shift every
+    // subsequent record's key/move and silently poison the harvest pipeline.
+    // Truncate the incomplete trailing record — never committed, since the
+    // header count didn't include it — back to the last aligned boundary, and
+    // derive the base count from the *complete* records actually on disk (which
+    // also recovers a prior crash that wrote data but not the updated count).
+    let base_count = if len == 0 {
+        0
+    } else {
+        let body = file.metadata()?.len().saturating_sub(HEADER_SIZE as u64);
+        let full = body / ENTRY_SIZE as u64;
+        let rem = body % ENTRY_SIZE as u64;
+        if rem != 0 {
+            let aligned_len = HEADER_SIZE as u64 + full * ENTRY_SIZE as u64;
+            tracing::warn!(
+                path = %path.display(),
+                extra_bytes = rem,
+                header_count = prev_count,
+                complete_records = full,
+                "overlay has a torn trailing record; truncating to the last aligned boundary before appending"
+            );
+            file.set_len(aligned_len)?;
+        }
+        // Trust the bytes on disk over a possibly-stale header count.
+        full
+    };
+
+    // Append the entries at the (now aligned) end of the file.
     file.seek(SeekFrom::End(0))?;
     let mut buf = Vec::with_capacity(entries.len() * ENTRY_SIZE);
     for e in entries {
@@ -208,8 +237,12 @@ pub fn append_entries(path: impl AsRef<Path>, entries: &[Jbk2Entry]) -> io::Resu
     }
     file.write_all(&buf)?;
 
+    // Flush the data before rewriting the count so the header can never claim
+    // more records than are durably on disk.
+    file.flush()?;
+
     // Update entry_count and build_timestamp in the header.
-    let new_count = prev_count + entries.len() as u64;
+    let new_count = base_count + entries.len() as u64;
     file.seek(SeekFrom::Start(8))?;
     file.write_all(&new_count.to_le_bytes())?;
     file.seek(SeekFrom::Start(16))?;

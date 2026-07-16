@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use futures::stream::{Stream, TryStreamExt};
+use futures::stream::{Stream, StreamExt, TryStreamExt};
 use reqwest::{Client, Response, StatusCode};
 use serde::de::DeserializeOwned;
 use thiserror::Error;
@@ -39,6 +39,19 @@ pub const MAX_CHAT_MESSAGE_LEN: usize = 140;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 const BACKOFF_MAX_TIME: Duration = Duration::from_secs(60);
 const BACKOFF_INTERVAL: Duration = Duration::from_millis(100);
+/// Bound the wait for a streaming endpoint's *response headers* (the
+/// `send().await` in `try_get_stream`). A half-open LB that accepts TCP but
+/// never sends headers would otherwise hang the reconnect loop / event-stream
+/// reopen forever. This caps only the open handshake — once headers arrive the
+/// body streams unbounded, so long-lived streams are unaffected.
+const STREAM_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
+/// Read-idle watchdog for NDJSON streams. Lichess emits keep-alive blank lines
+/// every few seconds; if *nothing at all* (not even a keep-alive) arrives for
+/// this long the connection is half-open (NAT/conntrack drop with no FIN/RST)
+/// and we surface a `StreamIdle` error so the caller resubscribes instead of
+/// waiting ~12 min for the OS TCP keep-alive. Set well above the keep-alive
+/// cadence so a healthy stream never trips it.
+const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 // ---------------------------------------------------------------------------
 // Endpoint catalogue
@@ -159,6 +172,9 @@ pub enum LichessError {
 
     #[error("stream decode error: {0}")]
     LinesDecode(#[from] tokio_util::codec::LinesCodecError),
+
+    #[error("stream idle for {0:?} (no data or keep-alive) — connection is half-open")]
+    StreamIdle(Duration),
 }
 
 pub type LichessResult<T> = Result<T, LichessError>;
@@ -406,7 +422,18 @@ impl Lichess {
         self.check_rate_limit(endpoint)?;
         let path = endpoint.render(args);
         let url = self.base_url.join(&path)?;
-        let response = self.client.get(url).send().await?;
+        // Bound only the response-header wait: a server that accepts TCP but
+        // never sends headers must not wedge the caller's reconnect loop. Once
+        // `send()` resolves, the body streams unbounded (the idle watchdog in
+        // `ndjson_stream` guards the streaming phase).
+        let response = tokio::time::timeout(STREAM_OPEN_TIMEOUT, self.client.get(url).send())
+            .await
+            .map_err(|_| {
+                LichessError::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "timed out waiting for stream response headers",
+                ))
+            })??;
         if response.status() == StatusCode::TOO_MANY_REQUESTS {
             self.set_rate_limit_delay(endpoint.template(), Self::rate_limit_delay_for(endpoint));
         }
@@ -692,7 +719,17 @@ impl Lichess {
 
         let status = response.status();
         let bytes = response.bytes().await?;
-        let mut challenge: ChallengeType = serde_json::from_slice(&bytes)?;
+        // A non-JSON error body (nginx/LB HTML on 5xx/429, plain text) must not
+        // abort the whole method with a `Json` error — that would bypass the
+        // status-keyed rate-limit classification below and let the matchmaker
+        // hammer a throttled account. Fall back to an empty `ChallengeType` so
+        // the HTTP-status signals (429 → `account_throttled_429`) still fire.
+        let mut challenge: ChallengeType = serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+            if !status.is_success() {
+                warn!(%status, error = %e, "challenge error body was not JSON; classifying by HTTP status only");
+            }
+            ChallengeType::default()
+        });
 
         let bot_rate_limited =
             status == StatusCode::TOO_MANY_REQUESTS && is_daily_game_rate_limit(&challenge);
@@ -833,6 +870,10 @@ fn build_client(
         // Send a TCP keep-alive every 30 s so dead-but-not-FIN'd connections
         // surface as read errors instead of silently hanging.
         .tcp_keepalive(Duration::from_secs(30))
+        // Bound TCP+TLS connection establishment so a black-holed connect can't
+        // hang a request (and, for streams, the reconnect loop) indefinitely.
+        // This is connect-only; it never limits an established stream's body.
+        .connect_timeout(STREAM_OPEN_TIMEOUT)
         .build()
         .map_err(LichessError::from)
 }
@@ -854,8 +895,20 @@ where
         .bytes_stream()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e));
     let reader = StreamReader::new(byte_stream);
-    FramedRead::new(reader, LinesCodec::new())
-        .map_err(LichessError::from)
+    let framed = Box::pin(FramedRead::new(reader, LinesCodec::new()).map_err(LichessError::from));
+    // Read-idle watchdog: re-poll the line stream under a timeout so a half-open
+    // connection (no data *and* no keep-alive) surfaces as a `StreamIdle` error
+    // the reconnect loops already handle, instead of hanging until the OS TCP
+    // keep-alive notices ~12 min later. Lichess keep-alive blank lines count as
+    // liveness — they arrive here as `Ok(String::new())` items and reset the
+    // timer before the empty-line filter below drops them.
+    futures::stream::unfold(framed, |mut framed| async move {
+        match tokio::time::timeout(STREAM_IDLE_TIMEOUT, framed.next()).await {
+            Ok(Some(item)) => Some((item, framed)),
+            Ok(None) => None, // genuine end of stream
+            Err(_elapsed) => Some((Err(LichessError::StreamIdle(STREAM_IDLE_TIMEOUT)), framed)),
+        }
+    })
         .try_filter(|line| futures::future::ready(!line.is_empty()))
         .and_then(|line| async move {
             // A single line that doesn't match the expected type (an unknown

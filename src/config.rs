@@ -22,6 +22,11 @@ pub const INFINITE: Option<i64> = None;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+    // Defaulted so a config that omits the token (relying on the
+    // `LICHESS_BOT_TOKEN` env override applied in `load`) still parses instead
+    // of failing deserialization before the override is even read. `validate`
+    // rejects an empty token afterwards.
+    #[serde(default)]
     pub token: String,
     pub url: String,
 
@@ -763,6 +768,20 @@ impl Config {
         if let Ok(token) = std::env::var("LICHESS_BOT_TOKEN") {
             cfg.token = token;
         }
+        // Anchor a *relative* daily-counter path to the config file's directory
+        // rather than the process CWD. Without this, starting the bot from a
+        // different directory (e.g. a manual restart after a VServer reboot,
+        // there is no autostart) silently opens a fresh counter file, loses the
+        // day's tally, and runs the bot straight into Lichess' 100/day 400s.
+        if !cfg.matchmaking.daily_counter_path.is_empty() {
+            let counter = Path::new(&cfg.matchmaking.daily_counter_path);
+            if counter.is_relative() {
+                if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+                    cfg.matchmaking.daily_counter_path =
+                        dir.join(counter).to_string_lossy().into_owned();
+                }
+            }
+        }
         cfg.validate()?;
         Ok(cfg)
     }
@@ -806,6 +825,15 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<()> {
+        // OAuth token: now `#[serde(default)]`, so a config that omits it parses
+        // to an empty string. Reject it here unless the `LICHESS_BOT_TOKEN` env
+        // override (applied in `load`) filled it — every API call needs it.
+        if self.token.trim().is_empty() {
+            bail!(
+                "No Lichess API token: set `token` in config.yml or the \
+                 LICHESS_BOT_TOKEN environment variable."
+            );
+        }
         // engine dir / binary
         let engine_dir = PathBuf::from(&self.engine.dir);
         if !engine_dir.is_dir() {

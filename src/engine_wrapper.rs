@@ -749,7 +749,16 @@ pub fn move_time(
     correspondence_move_time: Duration,
 ) -> (GoLimits, bool) {
     if move_count(state) < 2 {
-        return (first_move_time(), false);
+        // First move: keep the ≤10 s ceiling (Lichess allows 30 s and the
+        // opening needs no deep search), but make it clock-aware so short TC
+        // (e.g. 30+0) doesn't sink ⅓ of the clock into move 1 on a book miss —
+        // the embedded backend spends `movetime` as soft==hard. Cap at the same
+        // remaining/15 + inc budget as any other move, then at 10 s.
+        let clock = game_clock_time(side, state, setup_timer, move_overhead);
+        let budget = clock
+            .movetime_ms
+            .map_or(FIRST_MOVE_TIME_MS, |mt| mt.min(FIRST_MOVE_TIME_MS));
+        return (GoLimits::movetime(budget), false);
     }
     if is_correspondence {
         (
@@ -2158,12 +2167,21 @@ mod tests {
     }
 
     #[test]
-    fn first_move_time_is_ten_seconds_no_pondering() {
-        let state = state_with_moves("", 60_000, 60_000, 0, 0);
+    fn first_move_is_clock_aware_capped_at_ten_seconds() {
+        // Long clock: the 10 s ceiling holds (300000/15 = 20000 > 10000).
+        let long = state_with_moves("", 300_000, 300_000, 0, 0);
         let (limits, can_ponder) =
-            move_time(Side::White, &state, true, &Timer::zero(), Duration::ZERO, false, Duration::ZERO);
+            move_time(Side::White, &long, true, &Timer::zero(), Duration::ZERO, false, Duration::ZERO);
         assert_eq!(limits.movetime_ms, Some(10_000));
         assert!(!can_ponder);
+
+        // Short clock (30+0): the clock-aware cap kicks in (30000/15 = 2000), so
+        // the first move no longer sinks ⅓ of the clock on a book miss.
+        let short = state_with_moves("", 30_000, 30_000, 0, 0);
+        let (limits, no_ponder) =
+            move_time(Side::White, &short, true, &Timer::zero(), Duration::ZERO, false, Duration::ZERO);
+        assert_eq!(limits.movetime_ms, Some(2_000));
+        assert!(!no_ponder);
     }
 
     /// `Timer::zero()` starts at `Instant::now()`, so by the time the

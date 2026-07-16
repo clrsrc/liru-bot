@@ -32,7 +32,7 @@ use shakmaty::uci::UciMove;
 use shakmaty::{CastlingMode, Chess, Color, Position};
 use tokio::sync::Mutex;
 use tokio::task::JoinSet;
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use tracing::{debug, error, info, warn};
 
 use crate::blocklist::OnlineBlocklist;
@@ -77,6 +77,11 @@ fn is_tournament_source(source: Option<&str>) -> bool {
 /// `challenge.concurrency` gate for tournament games.
 const TOURNAMENT_PAIRING_LAG: Duration = Duration::from_secs(60);
 
+/// How long an accepted-but-not-yet-started challenge counts against the
+/// concurrency gate before it's assumed dead (challenge expired between accept
+/// and `gameStart`). Comfortably longer than the accept→gameStart latency.
+const ACCEPT_PENDING_TTL: Duration = Duration::from_secs(20);
+
 /// Per-bot state shared across tasks: blocklists, recent-challenge
 /// memory, and how many ongoing games each opponent has. Wrapped in a
 /// single mutex so the read-modify-write paths around challenge
@@ -103,6 +108,15 @@ struct BotState {
     /// when the task completes. Distinct from `active_games`, which
     /// `prefill_ongoing_games` populates before any task exists.
     spawned_games: HashSet<String>,
+    /// Timestamps of challenges we've accepted but whose `gameStart` (which is
+    /// what populates `active_games`) hasn't arrived yet. The concurrency gate
+    /// counts these alongside `active_games`: without it, two incoming
+    /// challenges processed before either game starts both read `active == 0`
+    /// and get accepted, yielding two parallel games (two engines → OOM) despite
+    /// `concurrency: 1`. Entries are removed when the matching game starts, and
+    /// expire via `ACCEPT_PENDING_TTL` so a challenge that never starts (expired
+    /// between accept and start) can't wedge the gate.
+    pending_accepts: Vec<Instant>,
     /// Time the most recent tournament game finished. Used by the
     /// outbound matchmaking tick to wait out Lichess's pairing-lag
     /// window before issuing the next challenge.
@@ -118,12 +132,23 @@ impl BotState {
             active_games: HashMap::new(),
             startup_correspondence_games: HashSet::new(),
             spawned_games: HashSet::new(),
+            pending_accepts: Vec::new(),
             last_tournament_game_ended: None,
         }
     }
 
     fn has_active_tournament_game(&self) -> bool {
         self.active_games.values().any(|g| g.is_tournament)
+    }
+
+    /// Drop expired pending-accept markers, then return the effective in-flight
+    /// game count (`active_games` + still-pending accepts) for the concurrency
+    /// gate. See [`BotState::pending_accepts`].
+    fn effective_active_games(&mut self) -> usize {
+        let now = Instant::now();
+        self.pending_accepts
+            .retain(|t| now.duration_since(*t) < ACCEPT_PENDING_TTL);
+        self.active_games.len() + self.pending_accepts.len()
     }
 }
 
@@ -513,6 +538,10 @@ async fn handle_event(
                             is_tournament,
                         },
                     );
+                    // This game is now counted in `active_games`; release one
+                    // reserved accept slot if any (no-op for outbound /
+                    // matchmaking starts, which never reserve one).
+                    s.pending_accepts.pop();
                     s.spawned_games.insert(game_id.clone());
                     if !already_known {
                         if let Some(name) = opponent.as_ref() {
@@ -542,7 +571,32 @@ async fn handle_event(
                 let queue = challengers.clone();
                 let game_id_for_task = game_id.clone();
                 games.spawn(async move {
-                    let res = play_game(li, cfg, profile, queue, game_id_for_task.clone()).await;
+                    // Catch panics *inside* the task so they come back as a
+                    // normal `(game_id, Err)` result the join arm can clean up
+                    // (active_games / spawned_games / opponent_engagements /
+                    // matchmaker.game_done()). Without this, a panic surfaces as
+                    // a `JoinError` with no game_id — nothing gets cleaned up, the
+                    // concurrency slot leaks, and at concurrency:1 the bot idles
+                    // (declining every challenge with "later") until a manual
+                    // restart. AssertUnwindSafe is sound here: on panic we discard
+                    // all captured state and return, observing no broken invariants.
+                    let res = std::panic::AssertUnwindSafe(play_game(
+                        li,
+                        cfg,
+                        profile,
+                        queue,
+                        game_id_for_task.clone(),
+                    ))
+                    .catch_unwind()
+                    .await
+                    .unwrap_or_else(|panic| {
+                        let msg = panic
+                            .downcast_ref::<&str>()
+                            .map(|s| s.to_string())
+                            .or_else(|| panic.downcast_ref::<String>().cloned())
+                            .unwrap_or_else(|| "unknown panic".to_string());
+                        Err(anyhow!("play_game panicked: {msg}"))
+                    });
                     (game_id_for_task, res)
                 });
                 info!(game_id = %game_id, "spawned game task");
@@ -607,7 +661,7 @@ async fn handle_challenge(
     let (active_count, supported_pair) = {
         let mut guard = state.lock().await;
         let s = &mut *guard;
-        let active = s.active_games.len();
+        let active = s.effective_active_games();
         let supported = challenge.is_supported(
             &config.challenge,
             &mut s.recent_bot_challenges,
@@ -658,7 +712,13 @@ async fn handle_challenge(
     }
 
     info!(challenge_id = %challenge.id, "accepting challenge");
+    // Reserve a concurrency slot for this accept until its `gameStart` lands
+    // (see `BotState::pending_accepts`), so a second incoming challenge
+    // processed before then is gated instead of also being accepted.
+    state.lock().await.pending_accepts.push(Instant::now());
     if let Err(e) = li.accept_challenge(&challenge.id).await {
+        // No game will start from a failed accept — release the reserved slot.
+        state.lock().await.pending_accepts.pop();
         warn!(challenge_id = %challenge.id, "accept failed: {e}");
     } else if challenge.challenger.is_bot {
         // Count the accepted incoming bot game toward the daily tally. Counted
@@ -914,10 +974,26 @@ async fn play_game(
         match evt.kind.as_deref() {
             Some("gameState") => {
                 let new_state = state_from_event(&evt);
+                // Count repetitions per *move*, not per event: Lichess also
+                // re-sends `gameState` for draw/takeback-offer flips (and every
+                // resubscribe restamps via `gameFull`), which would inflate the
+                // threefold counter and risk claiming a draw in a position that
+                // never actually repeated. Only stamp when the move list grew.
+                let old_ply = game
+                    .state
+                    .moves
+                    .as_deref()
+                    .map_or(0, |m| m.split_whitespace().count());
+                let new_ply = new_state
+                    .moves
+                    .as_deref()
+                    .map_or(0, |m| m.split_whitespace().count());
                 apply_new_moves(&game.state, &new_state, &mut board)?;
-                *position_counts
-                    .entry(crate::polyglot::polyglot_hash(&board))
-                    .or_insert(0) += 1;
+                if new_ply > old_ply {
+                    *position_counts
+                        .entry(crate::polyglot::polyglot_hash(&board))
+                        .or_insert(0) += 1;
+                }
                 prior_game = Some(game.clone());
                 game.state = new_state;
 
@@ -1017,9 +1093,10 @@ async fn play_game(
                         break;
                     }
                 }
-                *position_counts
-                    .entry(crate::polyglot::polyglot_hash(&board))
-                    .or_insert(0) += 1;
+                // No repetition stamp here: `gameFull` is a reconnect resync of
+                // an already-counted position, so restamping would double-count.
+                // A repetition spanning the disconnect is at worst under-counted,
+                // and Lichess still auto-draws at fivefold.
 
                 if is_game_over(&game.state) {
                     info!(game_id = %game.id, status = ?game.state.status, "game ended during reconnect");

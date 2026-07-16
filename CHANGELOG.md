@@ -1,5 +1,79 @@
 # Changelog
 
+## v0.4.0 (unreleased) — coupled with clrsrc v1.3.0
+
+### Engine
+- **clrsrc v1.3.0** — a pure search/correctness release; the network is **unchanged**
+  from v0.3.0. Notable: singular-extensions disabled (the SPRT-validated search-ordering
+  carrier), a TT mate/TB-win band rework so tablebase wins get their own band and
+  `mate N` scores mean genuine mates, mate-before-50-move-rule priority, an NNUE
+  loader guard (returns an error instead of an out-of-bounds panic on a foreign-bucket
+  net), and opening-book hygiene.
+- **Conversion-floor time trigger (default on).** In a clearly winning, low-piece
+  endgame with a healthy clock, the engine no longer banks time into near-instant
+  moves — it floors the per-move time so won positions get converted instead of
+  drifting toward a repetition draw. NNUE-only (needs no private data); tunable via the
+  `ConvFloor` / `ConvThreshold` / `ConvExtend` / `ConvMaxPieces` / `ConvMinRemaining`
+  UCI options on the subprocess backend.
+
+### Robustness & connectivity hardening
+Fixes from a full source audit, all of which had been running on the live bot:
+
+- **Stream-idle watchdog:** NDJSON streams now surface a `StreamIdle` error if no data
+  *or* keep-alive arrives for 60 s, so a half-open connection (NAT/conntrack drop with
+  no FIN/RST) triggers a resubscribe in seconds instead of hanging ~12 min for the OS
+  TCP keep-alive to notice.
+- **Stream-open & connect timeouts:** a 10 s cap on the stream response-header wait and
+  on TCP+TLS connect, so a server that accepts the socket but never responds can't wedge
+  the reconnect loop. Neither limits an established stream's body.
+- **Non-JSON error body tolerance:** a challenge endpoint returning a non-JSON body
+  (nginx/LB HTML on 5xx/429) no longer aborts the request path — it falls back to
+  HTTP-status-only rate-limit classification instead of hammering a throttled account.
+- **Game-task panic isolation:** a panic inside a game task is now caught and returned as
+  a normal per-game error the join arm cleans up, instead of leaking the concurrency slot
+  and idling the bot until a manual restart.
+- **Accept/gameStart race guard:** an accepted-but-not-yet-started challenge now reserves
+  a concurrency slot (with a TTL) so two challenges processed before either game starts
+  can't both be accepted into parallel games under `concurrency: 1`.
+- **Threefold-repetition counting fix:** repetitions are counted per *move*, not per
+  event — `gameState` re-sends (draw/takeback flips) and `gameFull` reconnect resyncs no
+  longer inflate the counter and risk claiming a draw in a position that never repeated.
+- **Experience-overlay self-heal:** a torn trailing record from an interrupted write is
+  truncated to the last aligned boundary before appending, and the header count is derived
+  from the complete records actually on disk.
+
+### Configuration
+- `token` is now optional in `config.yml` and can be supplied via the `LICHESS_BOT_TOKEN`
+  environment variable; an empty token is rejected at validation with a clear message.
+- A **relative** `matchmaking.daily_counter_path` is now anchored to the config file's
+  directory rather than the process working directory, so starting the bot from a
+  different directory no longer silently resets the day's game tally.
+
+### Time management
+- **Clock-aware first move:** the first move keeps its ≤10 s ceiling but is now also capped
+  at the normal `remaining/15 + inc` budget, so a book miss in a short time control no
+  longer sinks a third of the clock into move 1.
+
+---
+
+## v0.3.0 (2026-06-23)
+
+### Engine
+- **clrsrc v1.2.0** (KB16 network): late-IIR search-ordering improvement, time-management
+  v1, TT mate-depth guard, embedded PV fix.
+
+### Matchmaking & budget
+- **Daily bot-vs-bot budget** tracked against a UTC day counter, mirroring Lichess'
+  100-games/day cap, with a slice reserved for the bot's own matchmaking seeks.
+- **Escalating 429 back-off** on the challenge endpoint, and **per-opponent rate-limit
+  suppression** persisted across restarts so a post-restart burst can't re-trigger a 429
+  cascade.
+- **Content-decline skip:** an opponent that declines on content grounds (friends-only,
+  variant/rating mismatch) is skipped for the day instead of being misclassified as an
+  account rate-limit.
+
+---
+
 ## v0.2.0 (2026-06-10)
 
 ### Engine

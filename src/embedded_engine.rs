@@ -86,6 +86,18 @@ impl EmbeddedEngine {
             own_book: uci_options.get("OwnBook").map(|s| truthy(s)).unwrap_or(false),
             book_file: uci_options.get("BookFile").filter(|s| !s.is_empty()).cloned(),
             best_book_move: uci_options.get("BestBookMove").map(|s| truthy(s)).unwrap_or(true),
+            // TM-Trigger 2 "conversion floor" (clrsrc v1.3.0, SPRT-validated,
+            // NNUE-only — no private sidecar). Default ON, matching the engine's
+            // own `EmbeddedConfig::default().conv_floor = true` / UCI `ConvFloor`
+            // default; the four tuning knobs stay `None` so the engine applies its
+            // validated defaults (200 / 50 / 16 / 5000). The URisk trigger is NOT
+            // present in this struct on purpose — it is inert without the private
+            // net and was stripped from the public v1.3.0 engine.
+            conv_floor: true,
+            conv_threshold: None,
+            conv_extend: None,
+            conv_maxpieces: None,
+            conv_minremaining: None,
         };
 
         let engine = clrsrc::EmbeddedEngine::init(config);
@@ -196,11 +208,41 @@ impl EmbeddedEngine {
         self.store_telemetry(&outcome);
 
         let best_uci = outcome.best.to_uci();
-        let uci = shakmaty::uci::UciMove::from_ascii(best_uci.as_bytes())
-            .map_err(|_| EngineError::BestmoveParse(best_uci.clone()))?;
-        let mv = uci
-            .to_move(pos)
-            .map_err(|_| EngineError::BestmoveParse(best_uci.clone()))?;
+        let mv = match shakmaty::uci::UciMove::from_ascii(best_uci.as_bytes())
+            .ok()
+            .and_then(|uci| uci.to_move(pos).ok())
+        {
+            Some(mv) => mv,
+            None => {
+                // The engine returned a move we can't decode or that's illegal
+                // against our shakmaty position — a protocol glitch, `(none)` /
+                // `0000` at an instant deadline, or a fen+moves rebuild
+                // divergence between clrsrc's board and ours. Never forfeit the
+                // game on time over it: play any legal move and log loudly so
+                // the divergence gets caught. No legal moves means the game is
+                // already over, so surfacing the error there is correct.
+                match pos.legal_moves().first().cloned() {
+                    Some(fallback) => {
+                        // Repro trigger (clrsrc #275/A): dump the exact rebuild
+                        // inputs — `search_position(start_fen, moves)` is what
+                        // clrsrc reconstructs from, so start_fen + the move list
+                        // is a complete, replayable case. `ILLEGAL_BESTMOVE:` is
+                        // the greppable marker for the VServer log.
+                        tracing::error!(
+                            bestmove = %best_uci,
+                            start_fen = %start_fen,
+                            moves = %moves.join(" "),
+                            fallback = %fallback.to_uci(shakmaty::CastlingMode::Standard),
+                            "ILLEGAL_BESTMOVE: embedded engine returned an undecodable/illegal \
+                             bestmove for this start_fen+moves rebuild; playing a legal fallback \
+                             instead of forfeiting. Repro: search_position(start_fen, moves) — report to clrsrc"
+                        );
+                        fallback
+                    }
+                    None => return Err(EngineError::BestmoveParse(best_uci.clone())),
+                }
+            }
+        };
 
         // Per-move engine self-eval for the LMR-137 tactical watch / Klopper
         // analysis (befunde/lmr137_tactical_watch.md): embedded returns the score
