@@ -659,7 +659,20 @@ fn clamped_ms(value: Option<i64>) -> u64 {
 /// survives 15 moves. Coupled with clrsrc's `SOFT_INFLATION_CAP 1.5→2.5`; both
 /// halves go live together (one half alone is re-clamped by the other's old bound).
 fn movetime_cap_ms(remaining_ms: u64, inc_ms: u64) -> u64 {
-    remaining_ms / 15 + inc_ms
+    remaining_ms / MOVETIME_CAP_DIVISOR + inc_ms
+}
+
+/// Divisor of the per-move cap in [`movetime_cap_ms`].
+const MOVETIME_CAP_DIVISOR: u64 = 15;
+
+/// Clock reserve the embedded clock branch holds back from the engine in games
+/// without increment (see [`EmbeddedTiming::for_move`]). Coupled to
+/// `move_overhead` as `MOVETIME_CAP_DIVISOR × move_overhead`, so that
+/// `(remaining − reserve)/15 == remaining/15 − move_overhead`: the clock branch
+/// then has exactly the fixed-time branch's ceiling and zero-budget point
+/// (7500 ms at the live `move_overhead: 500`, the measured configuration).
+fn clock_reserve(move_overhead: Duration) -> Duration {
+    move_overhead * MOVETIME_CAP_DIVISOR as u32
 }
 
 /// Number of half-moves already played, derived from the UCI `moves`
@@ -752,7 +765,7 @@ pub fn move_time(
         // First move: keep the ≤10 s ceiling (Lichess allows 30 s and the
         // opening needs no deep search), but make it clock-aware so short TC
         // (e.g. 30+0) doesn't sink ⅓ of the clock into move 1 on a book miss —
-        // the embedded backend spends `movetime` as soft==hard. Cap at the same
+        // clrsrc spends `movetime` as soft==hard. So cap at the same
         // remaining/15 + inc budget as any other move, then at 10 s.
         let clock = game_clock_time(side, state, setup_timer, move_overhead);
         let budget = clock
@@ -1530,6 +1543,28 @@ impl EmbeddedTiming {
         move_overhead: Duration,
         limits: &GoLimits,
     ) -> Self {
+        Self::compute_with_reserve(side, state, setup_timer, move_overhead, limits, Duration::ZERO)
+    }
+
+    /// [`compute`] with a clock reserve held back from the engine in clock mode:
+    /// the side to move is handed `remaining − reserve` (floored at
+    /// [`MIN_CLOCK_MS`]) and the per-move cap is taken from that reduced clock,
+    /// while the flag-fall ceiling still uses the real clock. The opponent's
+    /// clock stays raw. A zero reserve is exactly [`compute`]; fixed-time mode
+    /// ignores the reserve.
+    ///
+    /// [`compute`]: EmbeddedTiming::compute
+    fn compute_with_reserve(
+        side: Side,
+        state: &GameStateType,
+        setup_timer: &Timer,
+        move_overhead: Duration,
+        limits: &GoLimits,
+        reserve: Duration,
+    ) -> Self {
+        let reserve_ms = reserve.as_millis() as u64;
+        let mut wtime_ms = clamped_ms(state.wtime);
+        let mut btime_ms = clamped_ms(state.btime);
         let elapsed = setup_timer.time_since_reset();
         let now = std::time::Instant::now();
         // Single overhead source = move_overhead (covers ½RTT + margin). B6 will
@@ -1552,19 +1587,26 @@ impl EmbeddedTiming {
                 // otherwise overshoot — normal moves keep clrsrc's soft
                 // adaptivity (unlike the subprocess movetime collapse).
                 let (remaining, inc) = match side {
-                    Side::White => (clamped_ms(state.wtime), clamped_ms(state.winc)),
-                    Side::Black => (clamped_ms(state.btime), clamped_ms(state.binc)),
+                    Side::White => (wtime_ms, clamped_ms(state.winc)),
+                    Side::Black => (btime_ms, clamped_ms(state.binc)),
                 };
                 let hard = Duration::from_millis(remaining).saturating_sub(buffer);
-                let cap = Duration::from_millis(movetime_cap_ms(remaining, inc));
+                let planned = remaining.saturating_sub(reserve_ms);
+                let cap = Duration::from_millis(movetime_cap_ms(planned, inc));
                 let budget = hard.min(cap).max(min_budget);
+                if reserve_ms > 0 {
+                    match side {
+                        Side::White => wtime_ms = planned.max(MIN_CLOCK_MS),
+                        Side::Black => btime_ms = planned.max(MIN_CLOCK_MS),
+                    }
+                }
                 (now + budget, 0)
             }
         };
 
         EmbeddedTiming {
-            wtime_ms: clamped_ms(state.wtime) as i64,
-            btime_ms: clamped_ms(state.btime) as i64,
+            wtime_ms: wtime_ms as i64,
+            btime_ms: btime_ms as i64,
             winc_ms: clamped_ms(state.winc) as i64,
             binc_ms: clamped_ms(state.binc) as i64,
             movestogo: limits.movestogo.unwrap_or(0),
@@ -1573,6 +1615,49 @@ impl EmbeddedTiming {
             nodes: limits.nodes.unwrap_or(0),
             max_deadline,
         }
+    }
+
+    /// Timing for one real move of a game. [`move_time`] hands every clock move
+    /// over as a `go movetime` (the subprocess overshoot cap), and [`compute`]
+    /// would read that as fixed-time mode: clrsrc then runs `soft = hard =
+    /// movetime` with its own time manager bypassed, and the overhead comes off
+    /// the per-move cap instead of the flag-fall ceiling — no budget at all once
+    /// `remaining/15 + inc <= move_overhead` (by0kZ2rC 02.10: 26 moves at 2048
+    /// nodes with 15 s on the clock, clrsrc #478/#489). So clock moves of games
+    /// **without increment** take the clock branch here, with
+    /// [`clock_reserve`] held back from the engine: the deadline is
+    /// `min(remaining − move_overhead, (remaining − reserve)/15)`, the same
+    /// ceiling and the same zero-budget point as the fixed-time branch, and
+    /// clrsrc's time manager plans only above it (SPRT 180+0 H1 +6.2 ± 5.0,
+    /// clrsrc #495/#498). With an increment no gain was measurable (#497), so
+    /// those moves — like the first move and correspondence — keep the fixed
+    /// `movetime` that [`move_time`] decided.
+    ///
+    /// [`compute`]: EmbeddedTiming::compute
+    pub fn for_move(
+        side: Side,
+        state: &GameStateType,
+        setup_timer: &Timer,
+        move_overhead: Duration,
+        limits: &GoLimits,
+        is_correspondence: bool,
+    ) -> Self {
+        let own_inc = match side {
+            Side::White => clamped_ms(state.winc),
+            Side::Black => clamped_ms(state.binc),
+        };
+        if is_correspondence || move_count(state) < 2 || own_inc > 0 {
+            return Self::compute(side, state, setup_timer, move_overhead, limits);
+        }
+        let clock = GoLimits { movetime_ms: None, ..limits.clone() };
+        Self::compute_with_reserve(
+            side,
+            state,
+            setup_timer,
+            move_overhead,
+            &clock,
+            clock_reserve(move_overhead),
+        )
     }
 }
 
@@ -1620,6 +1705,66 @@ impl EngineBackend {
         }
     }
 
+    /// Whether this backend is the in-process embedded engine. H2 book-ponder
+    /// only applies to embedded (the subprocess path has its own UCI ponder
+    /// machinery and no shared-STOP contract).
+    pub fn is_embedded(&self) -> bool {
+        match self {
+            EngineBackend::Subprocess(_) => false,
+            #[cfg(feature = "embedded")]
+            EngineBackend::Embedded(_) => true,
+        }
+    }
+
+    /// Depth of the last regular move's search (`Some(0)` = book hit). `None`
+    /// for the subprocess backend (H2 is embedded-only). Used by the H2 book gate.
+    pub fn last_depth(&self) -> Option<u32> {
+        match self {
+            EngineBackend::Subprocess(_) => None,
+            #[cfg(feature = "embedded")]
+            EngineBackend::Embedded(e) => e.last_depth(),
+        }
+    }
+
+    /// H2 book-ponder prefill (embedded only; no-op for the subprocess backend).
+    /// Blocking — run inside `spawn_blocking`. See
+    /// [`crate::embedded_engine::EmbeddedEngine::prefill_blocking`].
+    #[cfg_attr(not(feature = "embedded"), allow(unused_variables))]
+    pub fn prefill_blocking(
+        &mut self,
+        fen: Option<&str>,
+        moves: &[&str],
+        max_deadline: std::time::Instant,
+        game_ply: u32,
+    ) {
+        match self {
+            EngineBackend::Subprocess(_) => {}
+            #[cfg(feature = "embedded")]
+            EngineBackend::Embedded(e) => e.prefill_blocking(fen, moves, max_deadline, game_ply),
+        }
+    }
+
+    /// Raise the process-global STOP to abort an in-flight embedded prefill
+    /// (no-op without the embedded backend). Free of `self` because the engine
+    /// is moved into the prefill task while it runs.
+    pub fn request_prefill_stop() {
+        #[cfg(feature = "embedded")]
+        crate::embedded_engine::request_stop();
+    }
+
+    /// Clone the embedded prefill-cancel handle so the game loop can flip it
+    /// after the engine has moved into the prefill task (Arc-shared, clrsrc #298
+    /// a/b). `None` for the subprocess backend (H2 is embedded-only).
+    pub fn prefill_cancel_handle(
+        &self,
+    ) -> Option<std::sync::Arc<std::sync::atomic::AtomicBool>> {
+        match self {
+            EngineBackend::Subprocess(_) => None,
+            #[cfg(feature = "embedded")]
+            EngineBackend::Embedded(e) => Some(e.prefill_cancel_handle()),
+        }
+    }
+
     /// Run a search. `embedded_timing` is the B3 raw-clock/deadline bundle; the
     /// subprocess backend ignores it (it already got an overhead-subtracted
     /// `GoLimits` from [`move_time`]).
@@ -1652,6 +1797,16 @@ impl EngineBackend {
             EngineBackend::Subprocess(c) => c.last_info_pv(),
             #[cfg(feature = "embedded")]
             EngineBackend::Embedded(e) => e.last_info_pv(),
+        }
+    }
+
+    /// Instant at which the last regular search returned (embedded backend
+    /// only; the subprocess backend has no equivalent and yields `None`).
+    pub fn last_search_returned(&self) -> Option<std::time::Instant> {
+        match self {
+            EngineBackend::Subprocess(_) => None,
+            #[cfg(feature = "embedded")]
+            EngineBackend::Embedded(e) => e.last_search_returned(),
         }
     }
 
@@ -1850,7 +2005,10 @@ where
 /// 3. Record the resulting `score` in `draw_resign` and let it decide
 ///    whether to flip `draw_offered` / `resigned`.
 /// 4. Honour `min_time` (`tokio::time::sleep` if we got here too fast).
-/// 5. Either `li.resign(game.id)` or `li.make_move(game.id, uci, draw)`.
+/// 5. Either `li.resign(game.id)` (awaited — game ends anyway) or hand the
+///    move to a spawned delivery task (`li.make_move` with its retry budget)
+///    stored in `pending_delivery`, so a transport blip's retry loop never
+///    blocks this game task while our clock runs for the NEXT move.
 ///
 /// Returns the final `MoveDecision` for callers that want to add a
 /// commentary entry or update game state.
@@ -1871,10 +2029,21 @@ pub async fn play_move<R>(
     min_time: Duration,
     draw_resign: &mut DrawResignTracker,
     rng: &mut R,
+    pending_delivery: &mut Option<tokio::task::JoinHandle<()>>,
 ) -> EngineResult<MoveDecision>
 where
     R: rand::Rng + ?Sized,
 {
+    // Abort any delivery task still retrying the PREVIOUS move before we
+    // compute a new one. Past this point a stale re-POST could become a
+    // legal move in the meantime position and Lichess would play it for us;
+    // within one opponent ply that is impossible (our piece still occupies
+    // the retried move's target square), which is exactly the window this
+    // abort closes. A task whose move already reached Lichess terminates
+    // itself on first contact anyway (the re-POST gets a final 400).
+    if let Some(h) = pending_delivery.take() {
+        h.abort();
+    }
     let pre =
         choose_pre_engine_move(pos, history_moves.len(), game, li, cfg, rng).await;
 
@@ -1891,7 +2060,7 @@ where
             d
         }
         Some(PreEngineResult::Suggest(moves)) => {
-            let (mut limits, _) = move_time(
+            let (mut limits, effective_ponder) = move_time(
                 side,
                 &game.state,
                 can_ponder,
@@ -1900,15 +2069,22 @@ where
                 is_correspondence,
                 correspondence_move_time,
             );
+            let use_chess960 = game.variant_key == "chess960" || game.variant_key == "fromPosition";
             limits.searchmoves = moves
                 .iter()
-                .map(|m| shakmaty::uci::UciMove::from_standard(m).to_string())
+                .map(|m| {
+                    if use_chess960 {
+                        shakmaty::uci::UciMove::from_chess960(m).to_string()
+                    } else {
+                        shakmaty::uci::UciMove::from_standard(m).to_string()
+                    }
+                })
                 .collect();
-            let timing = EmbeddedTiming::compute(side, &game.state, setup_timer, move_overhead, &limits);
-            engine.search(pos, initial_fen, history_moves, &limits, can_ponder, timing).await?
+            let timing = EmbeddedTiming::for_move(side, &game.state, setup_timer, move_overhead, &limits, is_correspondence);
+            engine.search(pos, initial_fen, history_moves, &limits, effective_ponder, timing).await?
         }
         None => {
-            let (limits, _) = move_time(
+            let (limits, effective_ponder) = move_time(
                 side,
                 &game.state,
                 can_ponder,
@@ -1917,10 +2093,23 @@ where
                 is_correspondence,
                 correspondence_move_time,
             );
-            let timing = EmbeddedTiming::compute(side, &game.state, setup_timer, move_overhead, &limits);
-            engine.search(pos, initial_fen, history_moves, &limits, can_ponder, timing).await?
+            let timing = EmbeddedTiming::for_move(side, &game.state, setup_timer, move_overhead, &limits, is_correspondence);
+            engine.search(pos, initial_fen, history_moves, &limits, effective_ponder, timing).await?
         }
     };
+
+    // Post-search timeline (silent-gap class: 4hOqxTw6 07.07, mOTRuAyF
+    // 04.09 -- tens of seconds vanished between "engine eval" and "move sent"
+    // with nothing but in-memory code in between). T0 = search_position
+    // returned; the three lines below plus "move sent" in lichess_bot.rs each
+    // carry their offset from T0 so the next occurrence names the exact step.
+    let since_search = |t0: Option<std::time::Instant>| -> u64 {
+        t0.map(|t| t.elapsed().as_millis() as u64).unwrap_or(0)
+    };
+    let t0 = engine.last_search_returned();
+    if matches!(decision.source, MoveSource::Engine) {
+        debug!(game_id = %game.id, since_search_ms = since_search(t0), "post-search T1: search future returned");
+    }
 
     // The draw/resign tracker only considers engine evaluations — book
     // and tablebase moves get their own draw/resign flags directly from
@@ -1946,6 +2135,9 @@ where
         Vec::new()
     };
     engine.record_move_commentary(pos, history_moves.len(), decision.score, pv_uci);
+    if matches!(decision.source, MoveSource::Engine) {
+        debug!(game_id = %game.id, since_search_ms = since_search(t0), "post-search T2: bookkeeping done");
+    }
 
     // Heed min_time: don't fire a move back at Lichess sooner than this
     // (mostly relevant for very fast book/EGTB responses on bullet).
@@ -1964,11 +2156,31 @@ where
         } else {
             decision.uci_standard()
         };
-        // `make_move` already retries transient failures via `with_backoff`;
-        // an error here means it exhausted them, so the move never reached
-        // Lichess — log it loudly rather than silently flagging on time.
-        if let Err(e) = li.make_move(&game.id, &uci, decision.draw_offered).await {
-            warn!(game_id = %game.id, %uci, error = %e, "make_move failed; move not delivered to Lichess");
+        // Deliver in a background task instead of awaiting here. `make_move`
+        // retries transient failures via `with_backoff` (~2.1 s cadence on
+        // transport errors, 60 s budget) — awaited inline, that loop blocks
+        // this game task while the opponent's reply sits buffered on the game
+        // stream and OUR clock runs for the next move (MoJnzOoK: 9 retries =
+        // ~17 s burned, +8 position flagged; the move had in fact reached
+        // Lichess and only the response was lost — the final 400 was the
+        // "already played" symptom). Spawning keeps the full retry budget as
+        // late-delivery insurance for genuinely undelivered moves while the
+        // game task returns to the stream, which is the real evidence source.
+        // The caller aborts this handle before the next search (see the
+        // play_move entry guard) and at game-task teardown.
+        let delivery_li = li.clone();
+        let delivery_game_id = game.id.clone();
+        let draw_offered = decision.draw_offered;
+        *pending_delivery = Some(tokio::spawn(async move {
+            if let Err(e) = delivery_li
+                .make_move(&delivery_game_id, &uci, draw_offered)
+                .await
+            {
+                warn!(game_id = %delivery_game_id, %uci, error = %e, "make_move failed; move not delivered to Lichess");
+            }
+        }));
+        if matches!(decision.source, MoveSource::Engine) {
+            debug!(game_id = %game.id, since_search_ms = since_search(t0), "post-search T3: delivery spawned");
         }
     }
 
@@ -2289,6 +2501,100 @@ mod tests {
             .as_millis() as u64;
         // cap = 400/15 = 26 ms; hard = 400 − 300 = 100 ms → min = 26 ms.
         assert!(budget_ms <= 26, "expected cap ≤26 ms, got {budget_ms}");
+    }
+
+    #[test]
+    fn embedded_for_move_takes_clock_branch_for_clock_moves() {
+        // 60 s left, no increment, 500 ms overhead (the live config): `move_time`
+        // hands the move over as `go movetime 4000`. `for_move` must take the
+        // clock branch instead: movetime 0, own clock reduced by the 7500 ms
+        // reserve, opponent clock raw, deadline = (60000 − 7500)/15 = 3500 ms.
+        let state = state_with_moves("e2e4 e7e5", 60_000, 58_000, 0, 0);
+        let overhead = Duration::from_millis(500);
+        assert_eq!(clock_reserve(overhead), Duration::from_millis(7500));
+        let (limits, _) =
+            move_time(Side::White, &state, false, &Timer::zero(), overhead, false, Duration::ZERO);
+        assert_eq!(limits.movetime_ms, Some(4000));
+        let t = EmbeddedTiming::for_move(Side::White, &state, &Timer::zero(), overhead, &limits, false);
+        let budget_ms = t
+            .max_deadline
+            .saturating_duration_since(std::time::Instant::now())
+            .as_millis() as u64;
+        assert!(
+            (3_400..=3_500).contains(&budget_ms),
+            "expected ~3500 ms cap, got {budget_ms}"
+        );
+        assert_eq!(t.movetime_ms, 0);
+        assert_eq!(t.wtime_ms, 52_500);
+        assert_eq!(t.btime_ms, 58_000);
+    }
+
+    #[test]
+    fn embedded_for_move_reserve_floors_at_zero_budget_point() {
+        // At or below the reserve (7 s left, reserve 7500 ms) nothing is left to
+        // plan with: the engine sees the 1 ms clock floor and the deadline is
+        // the minimum budget, the same zero-budget point as the fixed-time
+        // branch (7000/15 − 500 < 0).
+        let state = state_with_moves("e2e4 e7e5 g1f3", 20_000, 7_000, 0, 0);
+        let overhead = Duration::from_millis(500);
+        let (limits, _) =
+            move_time(Side::Black, &state, false, &Timer::zero(), overhead, false, Duration::ZERO);
+        let t = EmbeddedTiming::for_move(Side::Black, &state, &Timer::zero(), overhead, &limits, false);
+        let budget_ms = t
+            .max_deadline
+            .saturating_duration_since(std::time::Instant::now())
+            .as_millis() as u64;
+        assert!(budget_ms <= MIN_CLOCK_MS, "expected minimum budget, got {budget_ms}");
+        assert_eq!(t.movetime_ms, 0);
+        assert_eq!(t.btime_ms, MIN_CLOCK_MS as i64);
+        assert_eq!(t.wtime_ms, 20_000);
+    }
+
+    #[test]
+    fn embedded_for_move_keeps_fixed_time_with_increment() {
+        // With an increment the move stays the fixed `movetime` from
+        // `move_time` (300000/15 + 2000 = 22000), clocks raw, no reserve.
+        let state = state_with_moves("e2e4 e7e5", 300_000, 295_000, 2_000, 2_000);
+        let overhead = Duration::from_millis(500);
+        let (limits, _) =
+            move_time(Side::White, &state, false, &Timer::zero(), overhead, false, Duration::ZERO);
+        assert_eq!(limits.movetime_ms, Some(22_000));
+        let t = EmbeddedTiming::for_move(Side::White, &state, &Timer::zero(), overhead, &limits, false);
+        let budget_ms = t
+            .max_deadline
+            .saturating_duration_since(std::time::Instant::now())
+            .as_millis() as u64;
+        assert!(
+            (21_400..=21_500).contains(&budget_ms),
+            "expected ~21500 ms budget, got {budget_ms}"
+        );
+        assert_eq!(t.movetime_ms, 22_000);
+        assert_eq!(t.wtime_ms, 300_000);
+        assert_eq!(t.btime_ms, 295_000);
+    }
+
+    #[test]
+    fn embedded_for_move_keeps_fixed_time_for_first_move_and_correspondence() {
+        // First move: the ≤10 s fixed budget from `move_time` stays a movetime.
+        let first = state_with_moves("e2e4", 300_000, 300_000, 0, 0);
+        let (limits, _) =
+            move_time(Side::Black, &first, false, &Timer::zero(), Duration::ZERO, false, Duration::ZERO);
+        let t = EmbeddedTiming::for_move(Side::Black, &first, &Timer::zero(), Duration::ZERO, &limits, false);
+        assert_eq!(t.movetime_ms, 10_000);
+
+        // Correspondence: the configured per-move search time stays a movetime.
+        let corr = state_with_moves("e2e4 e7e5", 86_400_000, 86_400_000, 0, 0);
+        let (limits, _) = move_time(
+            Side::White,
+            &corr,
+            false,
+            &Timer::zero(),
+            Duration::ZERO,
+            true,
+            Duration::from_secs(60),
+        );
+        let t = EmbeddedTiming::for_move(Side::White, &corr, &Timer::zero(), Duration::ZERO, &limits, true);
+        assert_eq!(t.movetime_ms, 60_000);
     }
 
     #[test]
