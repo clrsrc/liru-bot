@@ -27,10 +27,25 @@ engine:
   ponder: false                 # Legacy; prefer uci_ponder.
   uci_ponder: false             # Real UCI ponderhit / pondering.
 
+  # In-process clrsrc backend — only honoured in a build with `--features embedded`
+  # and only for standard chess; otherwise the engine above is run as a subprocess.
+  embedded: false
+  # Ponder-lite prefill (embedded backend + `challenge.concurrency: 1` only): search
+  # the position after our own move during the opponent's think so the next search
+  # starts warm. `book_ponder` only while still in the opening book, `opponent_brain`
+  # for the whole game (supersedes book_ponder). Both default off.
+  book_ponder: false
+  opponent_brain: false
+
   uci_options:
-    Threads: 1
+    Threads: 1                  # Also reaches the embedded clrsrc backend (Lazy SMP).
     Hash: 256
     # EvalFile: "/path/to/net.nnue"
+    # clrsrc-specific (embedded or subprocess): the search-gate booleans
+    # StmCoherent / URiskExtension / URiskFixedFormula / ConvFloor default to true
+    # in the embedded build, matching its built-in network; set them to false
+    # explicitly to switch one off. Contempt and the opening-book rating band are
+    # derived per game from the ratings and need no option here.
 
   draw_or_resign:
     offer_draw_enabled: false

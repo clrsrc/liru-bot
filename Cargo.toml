@@ -1,6 +1,6 @@
 [package]
 name = "liru-bot"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 authors = ["Stefan Kammann", "lichess-bot contributors (Python original)"]
 description = "LiRu-Bot — a bridge between the Lichess Bot API and chess engines. Rust port of lichess-bot."

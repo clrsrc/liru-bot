@@ -122,6 +122,9 @@ engine:
   name: "engine.exe"
   protocol: "uci"             # uci | xboard | homemade
   uci_ponder: false
+  embedded: false             # In-Process-clrsrc (nur Build mit --features embedded)
+  book_ponder: false          # Prefill in der Gegnerzeit, nur im Buch (embedded, concurrency 1)
+  opponent_brain: false       # Prefill nach jedem eigenen Zug (embedded, concurrency 1)
 
   uci_options:
     Threads: 1
@@ -184,6 +187,15 @@ die [clrsrc](https://github.com/clrsrc/clrsrc)-Engine (`--features embedded`), d
 der Suche **eine** autoritative absolute Wall-Clock-Deadline gibt statt der
 gestapelten Subprozess-Zeit-Approximation. Vertrag: clrsrcs `EMBEDDED.md`.
 
+Zusätzlich im Embedded-Backend: `uci_options.Threads` steuert die Lazy-SMP-Suche
+in-process; in gewerteten Partien gegen deutlich schwächere Bots wird ein
+Rating-abhängiger Contempt gesetzt und das Buch-Repertoire nach Rating-Band
+(stärker / gleich / schwächer ab ±100 Punkten) gewählt — beides je Partie aus den
+Ratings abgeleitet, ohne Konfiguration. Optional füllt ein Prefill
+(`book_ponder` / `opponent_brain`) in der Gegnerzeit die Hash-Tabelle vor; in
+Partien ohne Inkrement plant die Engine mit eigenem Zeitmanagement auf der echten
+Uhr (abzüglich einer Reserve von `15 × move_overhead`).
+
 > **Lizenz-Hinweis Kombiwerk.** Mit `--features embedded` wird clrsrc
 > (GPL-3.0-or-later) in LiRu-Bot (AGPL-3.0-or-later) als ein kombiniertes Werk
 > gelinkt (erlaubt nach AGPLv3 §13 / GPLv3 §13). Jeder Teil behält seine Lizenz;
@@ -203,7 +215,7 @@ cargo build --release
 # Ohne Gaviota (kein C-Toolchain nötig)
 cargo build --release --no-default-features
 
-# Mit eingebetteter clrsrc-Engine (nach clrsrc v1.1.0-Release)
+# Mit eingebetteter clrsrc-Engine (clrsrc v1.4.0, tag-gepinnt)
 cargo build --release --features embedded
 ```
 

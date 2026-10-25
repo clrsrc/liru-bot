@@ -94,7 +94,7 @@ for the [clrsrc](https://github.com/clrsrc/clrsrc) engine, enabled with
 `--features embedded`, which hands the search a single authoritative absolute
 wall-clock deadline instead of the stacked subprocess time approximation. The
 embedded API contract is documented in clrsrc's
-[`EMBEDDED.md`](https://github.com/clrsrc/clrsrc/blob/v1.1.0/EMBEDDED.md).
+[`EMBEDDED.md`](https://github.com/clrsrc/clrsrc/blob/v1.4.0/EMBEDDED.md).
 
 > **Combined-work license note.** Building with `--features embedded` links
 > clrsrc (GPL-3.0-or-later) into LiRu-Bot (AGPL-3.0-or-later) as a single
@@ -105,9 +105,21 @@ embedded API contract is documented in clrsrc's
 > (subprocess) build does **not** link clrsrc and ships as a pure AGPL-3.0
 > artifact.
 
-The embedded backend is a tag-pinned git dependency on clrsrc `v1.1.0` (no local
+The embedded backend is a tag-pinned git dependency on clrsrc `v1.4.0` (no local
 checkout needed). For local embedded development without network you can override
 it with a sibling `../clrsrc` path checkout (see the comment in `Cargo.toml`).
+
+What the embedded backend adds on top of the plain UCI subprocess:
+
+- `uci_options.Threads` drives clrsrc's Lazy-SMP search in-process.
+- A **rating-based contempt** in rated games against clearly weaker bot opponents, and a
+  **rating band** (stronger / equal / weaker by ±100 points) for the engine's opening-book
+  repertoire — both derived per game from the two ratings, no configuration needed.
+- An optional **ponder-lite prefill** (`engine.book_ponder` / `engine.opponent_brain`):
+  during the opponent's think the engine searches the position after our move so the
+  next search starts with a warm transposition table. Requires `challenge.concurrency: 1`.
+- In games **without increment** the engine plans with its own time manager on the real
+  clock (minus a reserve of `15 × move_overhead`) instead of a fixed per-move time.
 
 ## License
 

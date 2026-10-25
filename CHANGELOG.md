@@ -1,6 +1,80 @@
 # Changelog
 
-## v0.4.0 (unreleased) — coupled with clrsrc v1.3.0
+## v0.5.0 (unreleased) — coupled with clrsrc v1.4.0
+
+### Engine
+- **clrsrc v1.4.0** — the engine the live bot has been running: Lazy-SMP search
+  (`Threads`), correction history, a Stockfish-style repetition rule inside the search
+  tree, an opening-book repetition guard, book "oracle" mode and a rating-band book
+  repertoire. The embedded network is now the live CLRU1 container; the public
+  `EmbeddedConfig` is identical to the private one (the search-gate booleans
+  `StmCoherent` / `URiskExtension` / `URiskFixedFormula` / `ConvFloor` default to **on**,
+  matching the network). See clrsrc's own release notes for the engine side.
+
+### Embedded backend (`--features embedded`)
+- **Threads passthrough:** `uci_options.Threads` reaches the in-process engine.
+- **Rating-based contempt** (rated games only, against a clearly weaker bot opponent:
+  two stages by rating difference), with the contempt sign anchored to our colour so the
+  prefill (opponent at the root) and the main search agree in one transposition table.
+- **Rating band for the book repertoire:** the bot derives a per-game `OppBand`
+  (stronger / equal / weaker by ±100 rating points, rated and casual) and injects it into
+  the engine's book probe; the subprocess options are untouched.
+- **Ponder-lite prefill** (`engine.book_ponder`, `engine.opponent_brain`): after our own
+  move the engine searches the resulting position during the opponent's think so the next
+  search starts with a warm TT/history. `book_ponder` only while still in the opening
+  book, `opponent_brain` for the whole game. Race-safe reclaim (per-call cancel flag +
+  process-global stop, re-raised until the join completes), runaway guard
+  `min(opponent clock / 2, 10 s)`, reclaimed only by events that actually need the
+  engine (not by the echo of our own move). Gated to `challenge.concurrency: 1` and the
+  embedded backend; defaults off.
+- **Book hits carry no search verdict:** an engine-internal book reply (`depth 0`,
+  `nodes 0`) is harvested like a Polyglot book move instead of as an engine score of 0,
+  which used to anchor the experience book's variety cutoff on never-searched moves.
+- A non-integer `Hash` option is now warned about instead of silently falling back to 64 MB.
+
+### Time management
+- **Clock branch for no-increment games:** instead of a fixed `movetime`, the embedded
+  engine gets the real clock minus a reserve of `15 × move_overhead` and plans with its
+  own time manager above that floor; the ceiling and the zero-budget point equal the
+  previous fixed-time branch. Games with increment, the first move and correspondence
+  keep the fixed `movetime`.
+
+### Robustness & connectivity
+- **Non-blocking move delivery:** `make_move` runs in a background task with its full
+  retry budget, so a transport blip no longer blocks the game task while our clock runs
+  for the next move. A stale delivery is aborted before the next search and at game end.
+- **Game-stream resubscribe budget** raised from 12 s to 45 s (still capped at 10 % of the
+  remaining clock) with exponential 1-2-4-8 s back-off until the budget is spent, so a
+  multi-second Lichess outage no longer forfeits a game.
+- **Cooperative shutdown:** a cancellation token ends resubscribe back-off immediately on
+  Ctrl-C, and tasks aborted after the drain timeout are joined before the runtime is
+  dropped (fixes a process panic during shutdown that took a running game with it).
+- **Parallel-game guard:** our own pending outbound challenge is cancelled before an
+  incoming challenge is accepted (or the incoming one is declined if the cancel fails);
+  a second non-tournament game that would exceed `challenge.concurrency` is aborted
+  instead of played (`PARALLEL_GAME_ABORTED`). Pending accepts are keyed by challenge id
+  so `gameStart` releases exactly its own reservation, and the matchmaker counts them.
+- **Aborted games are not games:** when a counted game ends `aborted` before any play,
+  the daily bot-vs-bot tally point is handed back and the post-game challenge cooldown
+  is skipped.
+- **Non-blocking, lossless log writer** on a dedicated thread, so a slow stdout/file
+  write can no longer stall the game task between "engine decided" and "move sent".
+- **Post-search timeline** debug lines (`since_search_ms` on bookkeeping, delivery spawn
+  and "move sent") to pin any future silent gap to one step.
+- **Startup fingerprint line** `LIVE-FINGERPRINT bot=… net=… book=… config=…` (md5 of the
+  binary, `EvalFile`, `ExpFile` and the config file) so a game's log maps to the exact
+  configuration that played it.
+- **Chess960 / fromPosition:** `searchmoves` are rendered in Chess960 notation where the
+  variant needs it, and `fromPosition` games use the Chess960 castling mode; the effective
+  ponder flag from `move_time` is what the search receives.
+
+### Configuration
+- `engine.embedded`, `engine.book_ponder` and `engine.opponent_brain` are shown in
+  `config.yml.example` (all default `false`).
+
+---
+
+## v0.4.0 (2026-07-16) — coupled with clrsrc v1.3.0
 
 ### Engine
 - **clrsrc v1.3.0** — a pure search/correctness release; the network is **unchanged**
