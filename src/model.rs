@@ -510,6 +510,15 @@ impl Game {
         if self.is_white { wtime } else { btime }
     }
 
+    /// The opponent's remaining clock — the mirror of [`Self::my_remaining_time`].
+    /// Used to bound the H2 book-ponder prefill deadline to a fraction of the
+    /// time the opponent actually has left to reply.
+    pub fn opponent_remaining_time(&self) -> Duration {
+        let wtime = msec(self.state.wtime.map(|n| n as f64).unwrap_or(0.0));
+        let btime = msec(self.state.btime.map(|n| n as f64).unwrap_or(0.0));
+        if self.is_white { btime } else { wtime }
+    }
+
     pub fn result(&self) -> &'static str {
         let winner = self.state.winner.as_deref();
         let termination = self

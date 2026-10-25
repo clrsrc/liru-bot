@@ -658,6 +658,19 @@ impl Matchmaking {
         }
     }
 
+    /// Id of our outbound challenge that is still awaiting the opponent's
+    /// answer (`None` once it was accepted, declined, cancelled or never sent).
+    /// `handle_challenge` cancels it before accepting an incoming challenge so
+    /// a late accept by the challenged bot can't start a second parallel game
+    /// (Vorfall trvX6Pww/9iBcixas 30.09, Bus #467/#476).
+    pub fn outstanding_challenge_id(&self) -> Option<String> {
+        if self.challenge_id.is_empty() {
+            None
+        } else {
+            Some(self.challenge_id.clone())
+        }
+    }
+
     pub fn game_done(&mut self) {
         self.last_game_ended_delay.reset();
         self.show_earliest_challenge_time();
@@ -1015,6 +1028,19 @@ mod tests {
             daily_counter: Arc::new(Mutex::new(DailyCounter::load(""))),
             consecutive_generic_429: 0,
         }
+    }
+
+    #[test]
+    fn outstanding_challenge_id_tracks_pending_outbound_only() {
+        let mut mm = direct_struct();
+        assert_eq!(mm.outstanding_challenge_id(), None);
+        mm.challenge_id = "abcd1234".into();
+        assert_eq!(mm.outstanding_challenge_id().as_deref(), Some("abcd1234"));
+        // Discarding a different id leaves it pending; the matching id clears it.
+        mm.discard_challenge("other");
+        assert_eq!(mm.outstanding_challenge_id().as_deref(), Some("abcd1234"));
+        mm.discard_challenge("abcd1234");
+        assert_eq!(mm.outstanding_challenge_id(), None);
     }
 
     #[test]

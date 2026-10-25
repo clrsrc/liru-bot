@@ -100,6 +100,26 @@ pub struct EngineConfig {
     #[serde(default)]
     pub embedded: bool,
 
+    /// H2 book-ponder / TT-prefill (clrsrc Bus #283–#293): while still in the
+    /// opening book, run a background search on the current position during the
+    /// opponent's time so the book-exit search starts with a warm TT/history
+    /// instead of cold. Only safe at `challenge.concurrency == 1` (the abort
+    /// bridges to clrsrc's process-global STOP) and only with the embedded
+    /// backend — both are gated at runtime. Defaults off.
+    #[serde(default)]
+    pub book_ponder: bool,
+
+    /// Ponder-lite / "opponent brain" (clrsrc Bus #299): the whole-game
+    /// generalisation of `book_ponder`. When set, the background prefill fires
+    /// after EVERY own move (not just book moves) — searching the position with
+    /// the opponent to move during their whole think, so the TT/history is warm
+    /// for all their replies (no single-move guess like classic ponder → no miss
+    /// risk). Supersedes `book_ponder`'s book-only gate. Same guards
+    /// (`concurrency == 1`, embedded) and same race-safe reclaim as book-ponder.
+    /// Own flag for separate rollout/measurement; defaults off.
+    #[serde(default)]
+    pub opponent_brain: bool,
+
     #[serde(default)]
     pub interpreter: Option<String>,
     #[serde(default, deserialize_with = "deserialize_string_or_vec")]
@@ -834,6 +854,7 @@ impl Config {
                  LICHESS_BOT_TOKEN environment variable."
             );
         }
+
         // engine dir / binary
         let engine_dir = PathBuf::from(&self.engine.dir);
         if !engine_dir.is_dir() {

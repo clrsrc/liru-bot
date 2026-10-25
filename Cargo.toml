@@ -14,6 +14,7 @@ name = "liru-bot"
 path = "src/main.rs"
 
 [dependencies]
+md5 = "0.7"
 # Async runtime
 tokio = { version = "1.40", features = ["full"] }
 tokio-util = { version = "0.7", features = ["io", "codec"] }

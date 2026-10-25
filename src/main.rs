@@ -1,6 +1,6 @@
 //! Starting point for liru-bot (Rust port).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::{Context, Result};
@@ -57,7 +57,9 @@ enum Cmd {
 #[tokio::main]
 async fn main() -> ExitCode {
     let args = Args::parse();
-    init_logging(args.log.as_deref());
+    // Keep the non-blocking log worker alive for the whole run; dropping the
+    // guard at the end of `main` flushes whatever is still queued.
+    let _log_guard = init_logging(args.log.as_deref());
     info!(version = VERSION, "liru-bot (Rust port) starting");
     match dispatch(&args).await {
         Ok(()) => ExitCode::SUCCESS,
@@ -68,15 +70,27 @@ async fn main() -> ExitCode {
     }
 }
 
-fn init_logging(override_filter: Option<&str>) {
+fn init_logging(override_filter: Option<&str>) -> tracing_appender::non_blocking::WorkerGuard {
     let filter = override_filter
         .map(|s| EnvFilter::new(s))
         .or_else(|| std::env::var("RUST_LOG").ok().map(EnvFilter::new))
         .unwrap_or_else(|| EnvFilter::new("info"));
+    // Log writes go through a dedicated worker thread instead of a synchronous
+    // stdout write on the emitting task. On the production host stdout is redirected
+    // into the log file (ext4 on dm-crypt, shared with I/O-heavy co-tenants);
+    // a blocking write() there stalls the game task itself -- the silent-gap
+    // class (4hOqxTw6 07.07, mOTRuAyF 04.09: 36 s between "engine eval" and
+    // "move sent" with nothing but in-memory code in between). `lossy(false)`
+    // keeps every line: the emitter only blocks once the 128k-line queue is
+    // full, which a multi-second stall never reaches.
+    let (writer, guard) = tracing_appender::non_blocking::NonBlockingBuilder::default()
+        .lossy(false)
+        .finish(std::io::stdout());
     tracing_subscriber::registry()
         .with(filter)
-        .with(fmt::layer().with_target(false).with_level(true))
+        .with(fmt::layer().with_writer(writer).with_target(false).with_level(true))
         .init();
+    guard
 }
 
 async fn dispatch(args: &Args) -> Result<()> {
@@ -91,6 +105,7 @@ async fn dispatch(args: &Args) -> Result<()> {
 async fn run_bot(args: &Args) -> Result<()> {
     let config = Config::load(&args.config)
         .with_context(|| format!("loading config {}", args.config.display()))?;
+    log_live_fingerprint(&args.config, &config);
     let (mut li, _) = connect(&config).await?;
     let profile = li.get_profile().await.context("fetching bot profile")?;
     info!(
@@ -99,6 +114,56 @@ async fn run_bot(args: &Args) -> Result<()> {
         "connected to Lichess"
     );
     liru_bot::start_program(li, profile, config).await
+}
+
+/// Deploy-Ledger Tier 2 (clrsrc #277): one startup line pinning every input that
+/// determines play — the running binary, the NNUE (`EvalFile`), the book
+/// (`ExpFile`) and the config file — by md5 (same algorithm as the ledger's
+/// `md5sum`). A game's log timestamp then maps to the exact live config. Never
+/// fails startup: an unreadable file logs `?`, an unset option `-`.
+fn log_live_fingerprint(config_path: &Path, config: &Config) {
+    let bot = std::env::current_exe()
+        .map(|p| file_md5(&p))
+        .unwrap_or_else(|_| "?".to_string());
+    let net = engine_file_md5(config, "EvalFile");
+    let book = engine_file_md5(config, "ExpFile");
+    let cfg = file_md5(config_path);
+    info!("LIVE-FINGERPRINT bot={bot} net={net} book={book} config={cfg}");
+}
+
+/// md5 hex of a file's contents; `?` if it can't be read (never panics).
+fn file_md5(path: &Path) -> String {
+    match std::fs::read(path) {
+        Ok(bytes) => format!("{:x}", md5::compute(bytes)),
+        Err(_) => "?".to_string(),
+    }
+}
+
+/// md5 of an engine UCI-option file (`EvalFile` / `ExpFile`), resolving a
+/// relative value against the engine dir / working dir. `-` when the option is
+/// unset, `?` when set but unreadable.
+fn engine_file_md5(config: &Config, key: &str) -> String {
+    let Some(raw) = config
+        .engine
+        .uci_options
+        .get(key)
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    else {
+        return "-".to_string();
+    };
+    let p = Path::new(raw);
+    let candidates = [
+        p.to_path_buf(),
+        Path::new(&config.engine.dir).join(p),
+        Path::new(&config.engine.working_dir).join(p),
+    ];
+    let path = candidates
+        .iter()
+        .find(|c| c.exists())
+        .cloned()
+        .unwrap_or_else(|| p.to_path_buf());
+    file_md5(&path)
 }
 
 async fn list_bots(

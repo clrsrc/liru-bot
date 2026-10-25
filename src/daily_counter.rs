@@ -117,6 +117,16 @@ impl DailyCounter {
         self.state.bot_games
     }
 
+    /// Hand one tally point back — used when a counted game ends `aborted`
+    /// before any real play (not a game, neither for us nor for Lichess' cap).
+    /// Saturates at zero and persists. Returns the new tally.
+    pub fn decrement(&mut self) -> u32 {
+        self.roll_over(&today_utc());
+        self.state.bot_games = self.state.bot_games.saturating_sub(1);
+        self.save();
+        self.state.bot_games
+    }
+
     /// Atomically persist to disk (temp file + rename). Errors are logged but
     /// never propagated — a failed write must not crash the bot.
     fn save(&self) {
@@ -189,6 +199,17 @@ mod tests {
         assert_eq!(c.increment(), 1);
         assert_eq!(c.increment(), 2);
         assert_eq!(c.count(), 2);
+    }
+
+    #[test]
+    fn decrement_returns_a_point_and_saturates_at_zero() {
+        let mut c = DailyCounter::load("");
+        assert_eq!(c.increment(), 1);
+        assert_eq!(c.increment(), 2);
+        assert_eq!(c.decrement(), 1);
+        assert_eq!(c.decrement(), 0);
+        assert_eq!(c.decrement(), 0, "never goes negative");
+        assert_eq!(c.count(), 0);
     }
 
     #[test]
