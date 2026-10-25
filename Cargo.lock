@@ -290,8 +290,8 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "clrsrc"
-version = "1.3.0"
-source = "git+https://github.com/clrsrc/clrsrc?tag=v1.3.0#cf243fe04dd942f54aca758fb1d099b4834e0920"
+version = "1.4.0"
+source = "git+https://github.com/clrsrc/clrsrc?tag=v1.4.0#396d186dfdba99efb5fac0b1399bf0e361833e97"
 dependencies = [
  "shakmaty",
  "shakmaty-syzygy",
@@ -1064,6 +1064,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
 
 [[package]]
+name = "memmap2"
+version = "0.9.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6b0ca1155a9ecc25aa12e8313a119f32edf0255fea2f44839c4ac0a12b2ac157"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "minimal-lexical"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1633,6 +1642,7 @@ dependencies = [
  "bitflags",
  "byteorder",
  "libc",
+ "memmap2",
  "once_cell",
  "rustc-hash",
  "shakmaty",

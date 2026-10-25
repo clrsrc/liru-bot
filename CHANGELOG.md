@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.5.0 (unreleased) — coupled with clrsrc v1.4.0
+## v0.5.0 (2026-10-25) — coupled with clrsrc v1.4.0
 
 ### Engine
 - **clrsrc v1.4.0** — the engine the live bot has been running: Lazy-SMP search
